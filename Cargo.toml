@@ -1,0 +1,21 @@
+[package]
+name = "best-driver"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "best_driver"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.30", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }
+which = "7.0"
+tempfile = "3"
+base64 = "0.22"
