@@ -4,10 +4,18 @@ build-backend = "maturin"
 
 [project]
 name = "best-driver"
+description = "High-performance undetected Chromium CDP driver written in Rust with Python bindings"
+readme = "README.md"
 requires-python = ">=3.8"
+license = { text = "MIT" }
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/real-coder-xD/best-driver"
+Repository = "https://github.com/real-coder-xD/best-driver"
+"Bug Tracker" = "https://github.com/real-coder-xD/best-driver/issues"
