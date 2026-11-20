@@ -1,40 +1,49 @@
-// src/cdp.rs — Rust 2024, tokio + tokio-tungstenite: CDP JSON-RPC multiplexer over one WebSocket
+// src/cdp.rs — Rust 2021, tokio + tokio-tungstenite: single browser-level CDP WebSocket with flattened session multiplexing
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+
+use crate::error::{DriverError, DriverResult};
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
-pub type EventRx = broadcast::Receiver<(String, Value)>;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
-pub struct CdpSession {
+#[derive(Debug, Clone)]
+pub struct CdpEvent {
+    pub session_id: Option<String>,
+    pub method: String,
+    pub params: Value,
+}
+
+/// Single browser-level CDP WebSocket multiplexer supporting flattened sessions (`sessionId` routing).
+pub struct CdpConnection {
     next_id: AtomicU64,
     outgoing_tx: mpsc::UnboundedSender<String>,
     pending: Pending,
-    event_tx: broadcast::Sender<(String, Value)>,
+    event_tx: broadcast::Sender<CdpEvent>,
 }
 
-impl CdpSession {
-    pub async fn connect(ws_url: &str) -> Result<Arc<Self>, String> {
-        // Ảnh chụp full-page có thể vượt giới hạn frame 16MB mặc định
+impl CdpConnection {
+    pub async fn connect(ws_url: &str) -> DriverResult<Arc<Self>> {
+        // Full-page screenshots and large response bodies can exceed tungstenite's default 16MB cap
         let mut cfg = WebSocketConfig::default();
         cfg.max_message_size = None;
         cfg.max_frame_size = None;
 
         let (ws_stream, _) = connect_async_with_config(ws_url, Some(cfg), false)
             .await
-            .map_err(|e| format!("Lỗi kết nối WebSocket CDP: {}", e))?;
+            .map_err(|e| DriverError::Connection(format!("Không kết nối được WebSocket CDP: {}", e)))?;
 
         let (mut write, mut read) = ws_stream.split();
         let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
-        let (event_tx, _) = broadcast::channel(4096);
+        let (event_tx, _) = broadcast::channel(8192);
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let pending_recv = Arc::clone(&pending);
@@ -64,15 +73,23 @@ impl CdpSession {
                                 let _ = chan.send(res);
                             }
                         } else if let Some(method) = json.get("method").and_then(|m| m.as_str()) {
+                            let session_id = json
+                                .get("sessionId")
+                                .and_then(|s| s.as_str())
+                                .map(str::to_string);
                             let params = json.get("params").cloned().unwrap_or(Value::Null);
-                            let _ = event_tx_clone.send((method.to_string(), params));
+                            let _ = event_tx_clone.send(CdpEvent {
+                                session_id,
+                                method: method.to_string(),
+                                params,
+                            });
                         }
                     }
                     Message::Close(_) => break,
                     _ => {}
                 }
             }
-            // Socket đóng: huỷ mọi lệnh đang chờ để caller không treo
+            // Socket closed: fail all in-flight callers so nothing hangs
             pending_recv.lock().await.clear();
         });
 
@@ -84,35 +101,128 @@ impl CdpSession {
         }))
     }
 
-    pub async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
+    pub async fn call_raw(
+        &self,
+        session_id: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> DriverResult<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let payload = serde_json::json!({ "id": id, "method": method, "params": params });
+        let payload = match session_id {
+            Some(sid) => json!({ "id": id, "sessionId": sid, "method": method, "params": params }),
+            None => json!({ "id": id, "method": method, "params": params }),
+        };
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
         if let Err(e) = self.outgoing_tx.send(payload.to_string()) {
             self.pending.lock().await.remove(&id);
-            return Err(format!("Không thể gửi lệnh qua CDP WebSocket: {}", e));
+            return Err(DriverError::Connection(format!("Không thể gửi lệnh CDP [{}]: {}", method, e)));
         }
 
         match tokio::time::timeout(CALL_TIMEOUT, rx).await {
             Ok(Ok(Ok(val))) => Ok(val),
-            Ok(Ok(Err(err))) => Err(format!("CDP Error [{}]: {}", method, err)),
-            Ok(Err(_)) => Err(format!("CDP Call [{}] bị huỷ hoặc kết nối đã đóng", method)),
+            Ok(Ok(Err(detail))) => Err(DriverError::Cdp {
+                method: method.to_string(),
+                detail,
+            }),
+            Ok(Err(_)) => Err(DriverError::Connection(format!(
+                "CDP Call [{}] bị huỷ hoặc kết nối đã đóng",
+                method
+            ))),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                Err(format!("CDP Call [{}] timeout sau {}s", method, CALL_TIMEOUT.as_secs()))
+                Err(DriverError::Timeout(format!(
+                    "CDP Call [{}] timeout sau {}s",
+                    method,
+                    CALL_TIMEOUT.as_secs()
+                )))
             }
         }
     }
 
-    /// Đăng ký nhận event TRƯỚC khi gửi lệnh để không lỡ event đến sớm
-    pub fn subscribe(&self) -> EventRx {
-        self.event_tx.subscribe()
+    /// Sends a browser-level CDP command (no `sessionId`).
+    pub async fn call(&self, method: &str, params: Value) -> DriverResult<Value> {
+        self.call_raw(None, method, params).await
     }
 
-    pub async fn wait_until<F>(rx: &mut EventRx, timeout_ms: u64, mut pred: F) -> Result<(String, Value), String>
+    /// Creates a lightweight flattened session handle over this shared WebSocket.
+    pub fn session(self: &Arc<Self>, session_id: String) -> Arc<CdpSession> {
+        Arc::new(CdpSession {
+            conn: Arc::clone(self),
+            session_id,
+        })
+    }
+
+    /// Subscribes to ALL events across the browser WebSocket (all sessions).
+    pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
+        self.event_tx.subscribe()
+    }
+}
+
+/// Lightweight per-target flattened session handle multiplexed over the single browser `CdpConnection`.
+pub struct CdpSession {
+    conn: Arc<CdpConnection>,
+    pub session_id: String,
+}
+
+/// Event stream filtered strictly to one flattened `sessionId`.
+pub struct SessionEventRx {
+    rx: broadcast::Receiver<CdpEvent>,
+    session_id: String,
+}
+
+impl SessionEventRx {
+    pub async fn recv(&mut self) -> Result<(String, Value), broadcast::error::RecvError> {
+        loop {
+            match self.rx.recv().await {
+                Ok(ev) => {
+                    if ev.session_id.as_deref() == Some(self.session_id.as_str()) {
+                        return Ok((ev.method, ev.params));
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+}
+
+impl CdpSession {
+    /// Sends a CDP command scoped to this target's flattened `sessionId`.
+    pub async fn call(&self, method: &str, params: Value) -> DriverResult<Value> {
+        self.conn.call_raw(Some(&self.session_id), method, params).await
+    }
+
+    /// Sends a browser-level CDP command (e.g. `Target.closeTarget`, `Browser.grantPermissions`).
+    pub async fn call_browser(&self, method: &str, params: Value) -> DriverResult<Value> {
+        self.conn.call(method, params).await
+    }
+
+    /// Subscribes to CDP events belonging ONLY to this session.
+    pub fn subscribe(&self) -> SessionEventRx {
+        SessionEventRx {
+            rx: self.conn.subscribe(),
+            session_id: self.session_id.clone(),
+        }
+    }
+
+    /// Subscribes to ALL events on the underlying browser WebSocket (used for browser-scoped events like downloads).
+    pub fn subscribe_all(&self) -> broadcast::Receiver<CdpEvent> {
+        self.conn.subscribe()
+    }
+
+    /// Returns the shared browser-level CDP connection (for attaching child OOPIF sessions).
+    pub fn connection(&self) -> &Arc<CdpConnection> {
+        &self.conn
+    }
+
+    pub async fn wait_until<F>(
+        rx: &mut SessionEventRx,
+        timeout_ms: u64,
+        mut pred: F,
+    ) -> DriverResult<(String, Value)>
     where
         F: FnMut(&str, &Value) -> bool,
     {
@@ -126,13 +236,18 @@ impl CdpSession {
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => {
-                        return Err("Kênh sự kiện CDP đã đóng".to_string());
+                        return Err(DriverError::Connection("Kênh sự kiện CDP đã đóng".to_string()));
                     }
                 }
             }
         };
         tokio::time::timeout(Duration::from_millis(timeout_ms), fut)
             .await
-            .unwrap_or_else(|_| Err(format!("Timeout chờ sự kiện sau {}ms", timeout_ms)))
+            .unwrap_or_else(|_| {
+                Err(DriverError::Timeout(format!(
+                    "Chờ sự kiện CDP quá {}ms",
+                    timeout_ms
+                )))
+            })
     }
 }

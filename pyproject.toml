@@ -4,18 +4,59 @@ build-backend = "maturin"
 
 [project]
 name = "best-driver"
-description = "High-performance undetected Chromium CDP driver written in Rust with Python bindings"
+description = "Undetected, GIL-free Chromium browser automation for Python built in Rust (PyO3 + Tokio) over flattened CDP — a fast stealth alternative to Playwright, Selenium, DrissionPage, and nodriver"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
+keywords = [
+    "browser-automation",
+    "cdp",
+    "chrome-devtools-protocol",
+    "chromium",
+    "cloudflare-turnstile",
+    "drissionpage",
+    "headless-chrome",
+    "nodriver",
+    "playwright-alternative",
+    "pyo3",
+    "rust",
+    "selenium-alternative",
+    "stealth",
+    "tokio",
+    "undetected-chromedriver",
+    "web-scraping",
+]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Testing",
+    "Typing :: Typed",
 ]
 dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://github.com/real-coder-xD/best-driver"
+Documentation = "https://github.com/real-coder-xD/best-driver#readme"
 Repository = "https://github.com/real-coder-xD/best-driver"
+Changelog = "https://github.com/real-coder-xD/best-driver/blob/main/CHANGELOG.md"
 "Bug Tracker" = "https://github.com/real-coder-xD/best-driver/issues"
+
+[tool.maturin]
+python-source = "python"
+features = ["extension-module"]
