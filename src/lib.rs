@@ -210,6 +210,7 @@ pub struct BrowserCore {
     sessions_by_target: Arc<Mutex<HashMap<String, String>>>,
     armed_targets: ArmedMap,
     headless_ua: Option<Value>,
+    proxy: Option<String>,
     proxy_auth: Option<ProxyAuth>,
     auto_attach_task: Mutex<Option<JoinHandle<()>>>,
     port: u16,
@@ -226,6 +227,7 @@ impl BrowserCore {
         proxy: Option<String>,
     ) -> DriverResult<Self> {
         let mut args = extra_args.unwrap_or_default();
+        let raw_proxy = proxy.clone();
         let mut proxy_auth = None;
         if let Some(p) = proxy {
             let (server, auth) = split_proxy(&p);
@@ -344,6 +346,7 @@ impl BrowserCore {
             sessions_by_target,
             armed_targets,
             headless_ua,
+            proxy: raw_proxy,
             proxy_auth,
             auto_attach_task: Mutex::new(Some(auto_attach_task)),
             port,
@@ -388,7 +391,7 @@ impl BrowserCore {
         .await;
 
         let session = self.conn.session(session_id);
-        let tab = Tab::new(target_id.clone(), session).await?;
+        let tab = Tab::new(target_id.clone(), session, self.proxy.clone()).await?;
         if let Some(a) = &self.proxy_auth {
             tab.enable_proxy_auth(a.user.clone(), a.pass.clone()).await?;
         }
@@ -693,6 +696,43 @@ impl PyTab {
     #[getter]
     fn frame_id(&self) -> Option<String> {
         self.inner.frame_id().map(str::to_string)
+    }
+
+    #[getter]
+    fn proxy(&self) -> Option<String> {
+        self.inner.proxy().map(str::to_string)
+    }
+
+    // fingerprint & http_tls session sync
+    fn fingerprint<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        fut!(py, self.inner, |t| t.fingerprint().await.map(PyJson))
+    }
+
+    #[pyo3(signature = (path=None))]
+    fn storage_state<'py>(&self, py: Python<'py>, path: Option<String>) -> PyResult<Bound<'py, PyAny>> {
+        fut!(py, self.inner, |t| t.storage_state(path.as_deref()).await.map(PyJson))
+    }
+
+    #[pyo3(signature = (async_mode=true, **kwargs))]
+    fn tls_session<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        async_mode: bool,
+        kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.tls")?;
+        m.call_method("from_tab", (slf, async_mode), kwargs)
+    }
+
+    #[pyo3(signature = (session, default_url=None))]
+    fn sync_from_tls<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        session: Bound<'py, PyAny>,
+        default_url: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.tls")?;
+        m.call_method1("sync_to_tab", (slf, session, default_url))
     }
 
     // iframes & downloads
@@ -1340,6 +1380,11 @@ impl PyBrowser {
     #[getter]
     fn ws_url(&self) -> String {
         self.inner.ws_url.clone()
+    }
+
+    #[getter]
+    fn proxy(&self) -> Option<String> {
+        self.inner.proxy.clone()
     }
 
     fn is_alive<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {

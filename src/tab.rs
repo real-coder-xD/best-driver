@@ -6,6 +6,7 @@ use base64::prelude::*;
 use serde_json::{json, Map, Value};
 use tokio::task::JoinHandle;
 
+use crate::browser::derive_tls_preset;
 use crate::cdp::{CdpSession, SessionEventRx};
 use crate::error::{DriverError, DriverResult};
 use crate::input::{bezier_trajectory, jitter, key_def, swipe_trajectory};
@@ -19,8 +20,10 @@ pub const EVASION_JS: &str = include_str!("evasion.js");
 pub struct Tab {
     pub target_id: String,
     pub cdp: Arc<CdpSession>,
+    proxy: Option<String>,
     frame_chain: Vec<String>,
     mouse: StdMutex<(f64, f64)>,
+    last_remote_ip: StdMutex<Option<String>>,
     dialog_task: StdMutex<Option<JoinHandle<()>>>,
     auth_task: StdMutex<Option<JoinHandle<()>>>,
 }
@@ -38,7 +41,11 @@ impl Drop for Tab {
 }
 
 impl Tab {
-    pub async fn new(target_id: String, cdp: Arc<CdpSession>) -> DriverResult<Self> {
+    pub async fn new(
+        target_id: String,
+        cdp: Arc<CdpSession>,
+        proxy: Option<String>,
+    ) -> DriverResult<Self> {
         // Intentionally omit `Runtime.enable` so V8 never fires console serialization hooks
         // probed by anti-bot scripts (`console.debug(err)` / `Error.stack` getter traps).
         cdp.call("Page.enable", json!({})).await?;
@@ -48,8 +55,10 @@ impl Tab {
         Ok(Self {
             target_id,
             cdp,
+            proxy,
             frame_chain: Vec::new(),
             mouse: StdMutex::new((0.0, 0.0)),
+            last_remote_ip: StdMutex::new(None),
             dialog_task: StdMutex::new(None),
             auth_task: StdMutex::new(None),
         })
@@ -63,10 +72,31 @@ impl Tab {
         self.frame_chain.last().map(String::as_str)
     }
 
+    pub fn proxy(&self) -> Option<&str> {
+        self.proxy.as_deref()
+    }
+
     // ───────────────────────────── Navigation ─────────────────────────────
+
+    fn record_remote_ip(&self, method: &str, params: &Value) {
+        if method == "Network.responseReceived"
+            && params.get("type").and_then(|v| v.as_str()) == Some("Document")
+        {
+            if let Some(ip) = params.pointer("/response/remoteIPAddress").and_then(|v| v.as_str()) {
+                if !ip.is_empty() {
+                    if let Ok(mut g) = self.last_remote_ip.lock() {
+                        *g = Some(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
 
     pub async fn get(&self, url: &str, timeout_ms: Option<u64>, wait_until: &str) -> DriverResult<()> {
         let t_ms = timeout_ms.unwrap_or(30000);
+        if let Ok(mut g) = self.last_remote_ip.lock() {
+            *g = None;
+        }
         // Subscribe before navigating so fast load events are never missed
         let mut rx = self.cdp.subscribe();
         let res = self.cdp.call("Page.navigate", json!({ "url": url })).await?;
@@ -89,17 +119,29 @@ impl Tab {
         match wait_until {
             "none" | "commit" => Ok(()),
             "domcontentloaded" => {
-                let _ = CdpSession::wait_until(rx, t_ms, |m, _| m == "Page.domContentEventFired").await;
+                let _ = CdpSession::wait_until(rx, t_ms, |m, p| {
+                    self.record_remote_ip(m, p);
+                    m == "Page.domContentEventFired"
+                })
+                .await;
                 Ok(())
             }
             "networkidle" => {
                 let start = Instant::now();
-                let _ = CdpSession::wait_until(rx, t_ms, |m, _| m == "Page.loadEventFired").await;
+                let _ = CdpSession::wait_until(rx, t_ms, |m, p| {
+                    self.record_remote_ip(m, p);
+                    m == "Page.loadEventFired"
+                })
+                .await;
                 let left = t_ms.saturating_sub(start.elapsed().as_millis() as u64);
                 self.wait_network_idle_rx(rx, 500, left).await
             }
             _ => {
-                let _ = CdpSession::wait_until(rx, t_ms, |m, _| m == "Page.loadEventFired").await;
+                let _ = CdpSession::wait_until(rx, t_ms, |m, p| {
+                    self.record_remote_ip(m, p);
+                    m == "Page.loadEventFired"
+                })
+                .await;
                 Ok(())
             }
         }
@@ -121,7 +163,10 @@ impl Tab {
             let window = Duration::from_millis(idle_ms).min(deadline - now);
             match tokio::time::timeout(window, rx.recv()).await {
                 Err(_) => return Ok(()),
-                Ok(Ok((m, _))) if m.starts_with("Network.") => continue,
+                Ok(Ok((m, p))) if m.starts_with("Network.") => {
+                    self.record_remote_ip(&m, &p);
+                    continue;
+                }
                 Ok(Ok(_)) => continue,
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(Err(_)) => return Err(DriverError::Connection("Kênh sự kiện CDP đã đóng".to_string())),
@@ -1118,7 +1163,7 @@ impl Tab {
                     .await?;
                 if let Some(sid) = attached.get("sessionId").and_then(|v| v.as_str()) {
                     let child_session = self.cdp.connection().session(sid.to_string());
-                    return Tab::new(fid, child_session).await;
+                    return Tab::new(fid, child_session, self.proxy.clone()).await;
                 }
             }
         }
@@ -1129,8 +1174,10 @@ impl Tab {
         Ok(Tab {
             target_id: self.target_id.clone(),
             cdp: Arc::clone(&self.cdp),
+            proxy: self.proxy.clone(),
             frame_chain: chain,
             mouse: StdMutex::new((0.0, 0.0)),
+            last_remote_ip: StdMutex::new(None),
             dialog_task: StdMutex::new(None),
             auth_task: StdMutex::new(None),
         })
@@ -1570,6 +1617,129 @@ impl Tab {
             old.abort();
         }
         Ok(())
+    }
+
+    // ───────────────────────────── Fingerprint & TLS Session Handoff ─────────────────────────────
+
+    /// Captures the live browser's HTTP/TLS identity (`impersonate`, `user_agent`, `sec_ch_ua*`,
+    /// `accept_language`, `headers`, Chrome wire `header_order`, and `proxy`) for `http_tls` handoff.
+    pub async fn fingerprint(&self) -> DriverResult<Value> {
+        let info = self.evaluate(
+            "(() => { \
+                const d = navigator.userAgentData; \
+                const brands = d && Array.isArray(d.brands) \
+                    ? d.brands.map(b => `\"${b.brand}\";v=\"${b.version}\"`).join(', ') \
+                    : null; \
+                const langs = Array.isArray(navigator.languages) && navigator.languages.length \
+                    ? navigator.languages \
+                    : [navigator.language || 'en-US']; \
+                const acceptLang = langs.map((l, i) => i === 0 ? l : `${l};q=${Math.max(0.1, (1 - i * 0.1)).toFixed(1)}`).join(','); \
+                return { \
+                    user_agent: navigator.userAgent || '', \
+                    sec_ch_ua: brands, \
+                    sec_ch_ua_mobile: d ? (d.mobile ? '?1' : '?0') : '?0', \
+                    platform: d && d.platform ? d.platform : (navigator.platform || 'Windows'), \
+                    accept_language: acceptLang \
+                }; \
+            })()"
+        ).await?;
+
+        let ua = info.get("user_agent").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let platform_raw = info.get("platform").and_then(|v| v.as_str()).unwrap_or("Windows");
+        let platform_norm = if platform_raw.to_lowercase().contains("win") {
+            "Windows"
+        } else if platform_raw.to_lowercase().contains("mac") {
+            "macOS"
+        } else if platform_raw.to_lowercase().contains("android") {
+            "Android"
+        } else if platform_raw.to_lowercase().contains("linux") {
+            "Linux"
+        } else {
+            platform_raw
+        };
+        let sec_ch_ua_platform = format!("\"{}\"", platform_norm);
+        let sec_ch_ua_mobile = info.get("sec_ch_ua_mobile").and_then(|v| v.as_str()).unwrap_or("?0").to_string();
+        let accept_language = info.get("accept_language").and_then(|v| v.as_str()).unwrap_or("en-US,en;q=0.9").to_string();
+        let impersonate = derive_tls_preset(&ua, platform_norm);
+
+        let mut headers = Map::new();
+        headers.insert("User-Agent".into(), json!(ua));
+        if let Some(ch) = info.get("sec_ch_ua").and_then(|v| v.as_str()) {
+            headers.insert("Sec-CH-UA".into(), json!(ch));
+            headers.insert("Sec-CH-UA-Mobile".into(), json!(sec_ch_ua_mobile));
+            headers.insert("Sec-CH-UA-Platform".into(), json!(sec_ch_ua_platform));
+        }
+        headers.insert("Accept-Language".into(), json!(accept_language));
+
+        // Exact Chrome HTTP/2 wire header order (`accept-encoding` before `accept-language`)
+        let header_order = json!([
+            "sec-ch-ua",
+            "sec-ch-ua-mobile",
+            "sec-ch-ua-platform",
+            "upgrade-insecure-requests",
+            "user-agent",
+            "accept",
+            "sec-fetch-site",
+            "sec-fetch-mode",
+            "sec-fetch-user",
+            "sec-fetch-dest",
+            "accept-encoding",
+            "accept-language",
+            "cookie"
+        ]);
+
+        let remote_ip = self.last_remote_ip.lock().ok().and_then(|g| g.clone());
+        let local_address: Option<&str> = if self.proxy.is_none() {
+            match remote_ip.as_deref() {
+                Some(ip) if ip.contains(':') => Some("::"),
+                Some(ip) if ip.contains('.') => Some("0.0.0.0"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        Ok(json!({
+            "impersonate": impersonate,
+            "user_agent": ua,
+            "sec_ch_ua": info.get("sec_ch_ua").cloned().unwrap_or(Value::Null),
+            "sec_ch_ua_mobile": sec_ch_ua_mobile,
+            "sec_ch_ua_platform": sec_ch_ua_platform,
+            "accept_language": accept_language,
+            "headers": Value::Object(headers),
+            "header_order": header_order,
+            "proxy": self.proxy,
+            "remote_ip": remote_ip,
+            "local_address": local_address,
+        }))
+    }
+
+    /// Exports Playwright / `http_tls`-compatible `storage_state` containing all CDP cookies (including `HttpOnly`),
+    /// exact browser headers, TLS `impersonate` preset, wire `header_order`, and `proxy`.
+    pub async fn storage_state(&self, path: Option<&str>) -> DriverResult<Value> {
+        let cookies = self.get_cookies(None).await?;
+        let fp = self.fingerprint().await?;
+
+        let state = json!({
+            "cookies": cookies,
+            "origins": [],
+            "user_agent": fp.get("user_agent").cloned().unwrap_or(Value::Null),
+            "headers": fp.get("headers").cloned().unwrap_or_else(|| json!({})),
+            "impersonate": fp.get("impersonate").cloned().unwrap_or(Value::Null),
+            "header_order": fp.get("header_order").cloned().unwrap_or_else(|| json!([])),
+            "proxy": fp.get("proxy").cloned().unwrap_or(Value::Null),
+            "remote_ip": fp.get("remote_ip").cloned().unwrap_or(Value::Null),
+            "local_address": fp.get("local_address").cloned().unwrap_or(Value::Null),
+        });
+
+        if let Some(p) = path {
+            let text = serde_json::to_string_pretty(&state)
+                .map_err(|e| DriverError::Io(format!("Lỗi serialize storage_state: {}", e)))?;
+            tokio::fs::write(p, text)
+                .await
+                .map_err(|e| DriverError::Io(format!("Lỗi ghi file storage_state '{}': {}", p, e)))?;
+        }
+        Ok(state)
     }
 
     // ───────────────────────────── Cookies & Storage ─────────────────────────────

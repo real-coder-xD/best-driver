@@ -1,4 +1,5 @@
 /target
+/http_tls/
 
 # Build wheels & binary extensions
 *.whl

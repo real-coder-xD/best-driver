@@ -54,6 +54,36 @@ class DownloadInfo(TypedDict):
     state: str
 
 
+class BrowserFingerprint(TypedDict):
+    """Live Chromium HTTP/TLS identity captured by `Tab.fingerprint`."""
+
+    impersonate: str
+    user_agent: str
+    sec_ch_ua: Optional[str]
+    sec_ch_ua_mobile: str
+    sec_ch_ua_platform: str
+    accept_language: str
+    headers: dict[str, str]
+    header_order: list[str]
+    proxy: Optional[str]
+    remote_ip: Optional[str]
+    local_address: Optional[str]
+
+
+class StorageState(TypedDict):
+    """Playwright / `http_tls`-compatible state exported by `Tab.storage_state`."""
+
+    cookies: list[dict[str, Any]]
+    origins: list[Any]
+    user_agent: Optional[str]
+    headers: dict[str, str]
+    impersonate: Optional[str]
+    header_order: list[str]
+    proxy: Optional[str]
+    remote_ip: Optional[str]
+    local_address: Optional[str]
+
+
 class Element:
     """Native CDP element handle backed by `backendNodeId` (zero DOM mutation, Shadow DOM safe)."""
 
@@ -652,6 +682,27 @@ class Tab:
         """Send an arbitrary raw CDP command scoped to this tab's flattened `sessionId`."""
         ...
 
+    @property
+    def proxy(self) -> Optional[str]:
+        """Proxy URL inherited from the parent `Browser`, or `None`."""
+        ...
+
+    async def fingerprint(self) -> BrowserFingerprint:
+        """Capture the live Chromium HTTP/TLS identity (`impersonate`, UA, `Sec-CH-UA*`, `header_order`, `proxy`)."""
+        ...
+
+    async def storage_state(self, path: Optional[str] = None) -> StorageState:
+        """Export all CDP cookies (including `HttpOnly`) and live browser headers in `http_tls`/Playwright format."""
+        ...
+
+    async def tls_session(self, async_mode: bool = True, **kwargs: Any) -> Any:
+        """Create an `http_tls.AsyncSession` (or `Session`) synced with this tab's TLS preset, headers, proxy, and cookies."""
+        ...
+
+    async def sync_from_tls(self, session: Any, default_url: Optional[str] = None) -> int:
+        """Push updated cookies from an `http_tls` session back into this Chromium tab; returns count synced."""
+        ...
+
 
 class Browser:
     """Chromium instance managed over a single flattened browser-level CDP WebSocket."""
@@ -669,6 +720,11 @@ class Browser:
     @property
     def ws_url(self) -> str:
         """Browser-level CDP WebSocket endpoint URL."""
+        ...
+
+    @property
+    def proxy(self) -> Optional[str]:
+        """Proxy URL passed to `best_driver.start(proxy=...)`, or `None`."""
         ...
 
     async def is_alive(self) -> bool:
@@ -723,8 +779,19 @@ async def start(
     ...
 
 
+async def tls_session(tab: Tab, async_mode: bool = True, **kwargs: Any) -> Any:
+    """Create an `http_tls.AsyncSession` (or `Session`) synchronized with `tab`."""
+    ...
+
+
+async def sync_from_tls(tab: Tab, session: Any, default_url: Optional[str] = None) -> int:
+    """Push cookies from an `http_tls` session back into `tab`."""
+    ...
+
+
 __all__ = [
     "Browser",
+    "BrowserFingerprint",
     "DownloadInfo",
     "Element",
     "ElementRect",
@@ -732,7 +799,10 @@ __all__ = [
     "ImageFormat",
     "MouseButton",
     "NetworkResponse",
+    "StorageState",
     "Tab",
     "WaitUntil",
     "start",
+    "sync_from_tls",
+    "tls_session",
 ]

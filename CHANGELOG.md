@@ -2,6 +2,15 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.1.6] - 2026-11-21
+
+### Synchronized `http_tls` Fingerprint & Session Handoff (`best-driver[tls]`)
+- **One-Line Session Bridge (`tab.tls_session()`, `tab.sync_from_tls()`)**: Added optional extra `pip install "best-driver[tls]"` (`http-tls>=0.6.2`) and `python/best_driver/tls.py` to hand off active Chromium sessions to `http_tls.AsyncSession` / `Session` while keeping outbound proxy/IP family, TLS/HTTP2 preset, `User-Agent`, `Sec-CH-UA*`, 13-header HTTP/2 wire order, and domain-scoped `HttpOnly` cookies aligned.
+- **Automatic Dual-Stack IPv6/IPv4 Parity**: `Tab` now records the active document's `remoteIPAddress` from CDP `Network.responseReceived` and derives `local_address` (`"::"` for IPv6, `"0.0.0.0"` for IPv4 when no proxy is configured) so `http_tls` exits from the exact same IP as Chromium on dual-stack networks.
+- **Default TLS/HTTP2 Alignment (`--disable-quic` + `TLSTrustAnchorIDs`)**: Enabled `--disable-quic` and `TLSTrustAnchorIDs` in Chromium launch flags (with safe `--disable-features=` merging for `extra_args`) and aligned `Sec-CH-UA` GREASE brand order so Chromium and `http_tls` match on `HTTP/2`, all 15 TLS cipher suites (`8daaf6152771`), all 16 standard TLS extensions, Akamai HTTP/2 (`1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`), and 13/13 HTTP/2 wire header order out of the box.
+- **New Public APIs & PEP 561 Stubs**: Exposed `browser.proxy`, `tab.proxy`, `await tab.fingerprint()`, `await tab.storage_state(path=None)`, `await tab.tls_session(async_mode=True, **kwargs)`, `await tab.sync_from_tls(session, default_url=None)`, `BrowserFingerprint`, and `StorageState` with 100% `.pyi` parity.
+- **Verification Scripts**: Added `examples/test_tls_sync.py` and `examples/test_real_handoff.py` (including `--multi-cf` 6-origin Cloudflare edge suite and `--url`/`--proxy`/`--headful` custom CLI testing).
+
 ## [0.1.5] - 2026-11-21
 
 ### Stealth & Closed Shadow DOM

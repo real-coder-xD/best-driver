@@ -84,6 +84,12 @@ pub fn build_headless_ua_override(raw_ua: &str) -> Option<Value> {
         .unwrap_or("130.0.0.0")
         .to_string();
     let major = full_ver.split('.').next().unwrap_or("130").to_string();
+    let grease = if major.parse::<u32>().map(|v| v % 2 == 0).unwrap_or(false) {
+        "24"
+    } else {
+        "99"
+    };
+    let grease_full = format!("{grease}.0.0.0");
     let (platform, platform_ver, arch) = if clean_ua.contains("Windows") {
         ("Windows", "10.0.0", "x86")
     } else if clean_ua.contains("Mac OS X") {
@@ -95,14 +101,14 @@ pub fn build_headless_ua_override(raw_ua: &str) -> Option<Value> {
         "userAgent": clean_ua,
         "userAgentMetadata": {
             "brands": [
-                { "brand": "Not(A:Brand", "version": "99" },
                 { "brand": "Google Chrome", "version": major },
-                { "brand": "Chromium", "version": major }
+                { "brand": "Chromium", "version": major },
+                { "brand": "Not)A;Brand", "version": grease }
             ],
             "fullVersionList": [
-                { "brand": "Not(A:Brand", "version": "99.0.0.0" },
                 { "brand": "Google Chrome", "version": full_ver },
-                { "brand": "Chromium", "version": full_ver }
+                { "brand": "Chromium", "version": full_ver },
+                { "brand": "Not)A;Brand", "version": grease_full }
             ],
             "fullVersion": full_ver,
             "platform": platform,
@@ -114,6 +120,72 @@ pub fn build_headless_ua_override(raw_ua: &str) -> Option<Value> {
             "wow64": false
         }
     }))
+}
+
+/// Derives the matching `http_tls` BoringSSL impersonation preset (e.g. `chrome_157`, `chrome_149_macos`, `edge_148`)
+/// from the live Chromium `User-Agent` and platform string.
+pub fn derive_tls_preset(ua: &str, platform: &str) -> String {
+    let lower_plat = platform.to_lowercase();
+    let os_suffix = if lower_plat.contains("mac") || ua.contains("Mac OS X") {
+        "_macos"
+    } else if lower_plat.contains("android") || ua.contains("Android") {
+        "_android"
+    } else if lower_plat.contains("linux") || ua.contains("Linux") {
+        "_linux"
+    } else {
+        ""
+    };
+
+    if let Some(after_edge) = ua.split("Edg/").nth(1) {
+        let major = after_edge
+            .split(['.', ' '])
+            .next()
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or("148");
+        return format!("edge_{major}{os_suffix}");
+    }
+
+    let major = ua
+        .split("Chrome/")
+        .nth(1)
+        .and_then(|s| s.split(['.', ' ']).next())
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or("149");
+    format!("chrome_{major}{os_suffix}")
+}
+
+/// Merges caller `extra_args` into base Chromium flags, combining multiple `--disable-features=` flags
+/// into one comma-separated list so Chromium never silently drops earlier disabled features.
+fn merge_browser_args(mut base: Vec<String>, extras: Option<Vec<String>>) -> Vec<String> {
+    let Some(extras) = extras else {
+        return base;
+    };
+    let mut extra_disabled: Vec<String> = Vec::new();
+    let mut passthrough: Vec<String> = Vec::new();
+    for arg in extras {
+        if let Some(feats) = arg.strip_prefix("--disable-features=") {
+            for f in feats.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                extra_disabled.push(f.to_string());
+            }
+        } else {
+            passthrough.push(arg);
+        }
+    }
+    if !extra_disabled.is_empty() {
+        if let Some(existing) = base.iter_mut().find(|a| a.starts_with("--disable-features=")) {
+            for f in extra_disabled {
+                let current = existing.strip_prefix("--disable-features=").unwrap_or("");
+                if !current.split(',').any(|x| x == f) {
+                    existing.push(',');
+                    existing.push_str(&f);
+                }
+            }
+        } else {
+            base.push(format!("--disable-features={}", extra_disabled.join(",")));
+        }
+    }
+    base.extend(passthrough);
+    base
 }
 
 pub struct BrowserProcess {
@@ -209,7 +281,8 @@ impl BrowserProcess {
             "--disable-infobars".to_string(),
             "--silent-debugger-extension-api".to_string(),
             "--disable-blink-features=AutomationControlled".to_string(),
-            "--disable-features=IsolateOrigins,site-per-process".to_string(),
+            "--disable-features=IsolateOrigins,site-per-process,TLSTrustAnchorIDs".to_string(),
+            "--disable-quic".to_string(),
             "--disable-ipc-flooding-protection".to_string(),
             "--password-store=basic".to_string(),
             "--use-mock-keychain".to_string(),
@@ -226,9 +299,7 @@ impl BrowserProcess {
             args.push("--headless=new".to_string());
         }
 
-        if let Some(extras) = extra_args {
-            args.extend(extras);
-        }
+        args = merge_browser_args(args, extra_args);
 
         args.push("about:blank".to_string());
 
@@ -317,5 +388,60 @@ mod tests {
     fn headful_ua_is_not_overridden() {
         let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
         assert!(build_headless_ua_override(ua).is_none());
+    }
+
+    #[test]
+    fn derive_tls_preset_matches_browser_and_os() {
+        assert_eq!(
+            derive_tls_preset(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/157.0.0.0 Safari/537.36",
+                "Windows"
+            ),
+            "chrome_157"
+        );
+        assert_eq!(
+            derive_tls_preset(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/149.0.0.0 Safari/537.36",
+                "macOS"
+            ),
+            "chrome_149_macos"
+        );
+        assert_eq!(
+            derive_tls_preset(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/145.0.0.0 Safari/537.36",
+                "Linux"
+            ),
+            "chrome_145_linux"
+        );
+        assert_eq!(
+            derive_tls_preset(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0",
+                "Windows"
+            ),
+            "edge_148"
+        );
+    }
+
+    #[test]
+    fn merge_browser_args_combines_disable_features() {
+        let base = vec![
+            "--disable-features=IsolateOrigins,TLSTrustAnchorIDs".to_string(),
+            "--disable-quic".to_string(),
+        ];
+        let merged = merge_browser_args(
+            base,
+            Some(vec![
+                "--disable-features=TLSTrustAnchorIDs,Translate".to_string(),
+                "--lang=en-US".to_string(),
+            ]),
+        );
+        assert_eq!(
+            merged,
+            vec![
+                "--disable-features=IsolateOrigins,TLSTrustAnchorIDs,Translate".to_string(),
+                "--disable-quic".to_string(),
+                "--lang=en-US".to_string(),
+            ]
+        );
     }
 }

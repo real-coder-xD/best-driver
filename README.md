@@ -84,6 +84,9 @@ Pre-built wheels are published to PyPI for **14 targets** (Windows x64/x86/ARM64
 
 ```bash
 pip install best-driver
+
+# Optional: include the synchronized Rust BoringSSL HTTP client bridge (http-tls)
+pip install "best-driver[tls]"
 ```
 
 ### Browser Auto-Discovery
@@ -360,6 +363,32 @@ browser = await best_driver.start(
 )
 ```
 
+### Synchronized `http_tls` Session Handoff (Shared Fingerprint & Cookies)
+
+When `http-tls` is installed (`pip install "best-driver[tls]"`), `await tab.tls_session()` hands off the active Chromium session to a high-throughput Rust BoringSSL `http_tls.AsyncSession` (or sync `Session`) while synchronizing all five wire-level identity layers:
+
+1. **Outbound Proxy**: Inherits `browser.proxy` verbatim.
+2. **TLS & HTTP/2 Preset**: Automatically maps Chromium's live version and OS (e.g. `chrome_157`, `chrome_149_macos`, `edge_148`) so cipher suites and Akamai HTTP/2 frames align.
+3. **Exact Headers & Client Hints**: Transfers live `User-Agent`, `Sec-CH-UA`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Platform`, and `Accept-Language`.
+4. **Exact HTTP/2 Wire Header Order**: Enforces Chromium's 13-header wire sequence (`sec-ch-ua` ... `accept-encoding`, `accept-language`, `priority`).
+5. **Bi-Directional Cookie Jar (Including `HttpOnly`)**: Pulls all CDP cookies via `tab.storage_state()` into `http_tls`, and pushes refreshed or host-only cookies back into Chromium via `await tab.sync_from_tls(tls)`.
+
+```python
+async with await best_driver.start(headless=True, proxy="http://user:pass@host:8080") as browser:
+    tab = await browser.get("https://example.com", wait_until="networkidle")
+
+    # 1 line: create an http_tls.AsyncSession sharing proxy, TLS/H2 preset, headers, order & HttpOnly cookies
+    async with await tab.tls_session() as tls:
+        resp = await tls.get("https://example.com/api/items")
+        print(resp.status_code, resp.json())
+
+        # Push any newly issued server cookies back into the live Chromium tab
+        await tab.sync_from_tls(tls)
+
+    # Export Playwright / http_tls compatible storage_state.json at any time
+    state = await tab.storage_state("session_state.json")
+```
+
 ---
 
 ## Biological Input Physics and Forms
@@ -479,6 +508,7 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 | `port` | `int` (property) | Ephemeral loopback TCP debugging port (`127.0.0.1:<port>`). |
 | `user_data_dir` | `str` (property) | Active Chromium profile directory path. |
 | `ws_url` | `str` (property) | Browser-level CDP WebSocket URL shared by all flattened sessions. |
+| `proxy` | `Optional[str]` (property) | Proxy URL passed to `best_driver.start(proxy=...)`, or `None`. |
 | `is_alive()` | `async () -> bool` | Returns `True` if the Chromium child process is still running. |
 | `main_tab()` | `async () -> Tab` | Returns the primary active page tab (creating one if none exist). |
 | `new_tab()` | `async (url: str = "about:blank") -> Tab` | Opens a new tab via `Target.createTarget` with evasion armed before navigation. |
@@ -516,7 +546,11 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 | Method / Property | Signature | Description |
 | :--- | :--- | :--- |
 | `target_id`, `session_id` | `str` (properties) | Target ID and flattened CDP `sessionId`. |
-| `frame_id` | `Optional[str]` (property) | Frame ID if scoped to an in-process iframe, else `None`. |
+| `frame_id`, `proxy` | `Optional[str]` (properties) | Frame ID if scoped to an in-process iframe; inherited browser proxy URL. |
+| `fingerprint()` | `async () -> BrowserFingerprint` | Captures live `impersonate`, `user_agent`, `sec_ch_ua*`, `accept_language`, `headers`, `header_order`, and `proxy`. |
+| `storage_state()` | `async (path: Optional[str] = None) -> StorageState` | Exports all CDP cookies (including `HttpOnly`) and live browser headers in Playwright / `http_tls` format. |
+| `tls_session()` | `async (async_mode: bool = True, **kwargs) -> Any` | Creates an `http_tls.AsyncSession` (or `Session`) synced with this tab's fingerprint, proxy, headers, and cookies. |
+| `sync_from_tls()` | `async (session: Any, default_url: Optional[str] = None) -> int` | Pushes updated cookies from an `http_tls` session back into this Chromium tab. |
 | `iframe()` | `async (selector: str, timeout_ms: int = 10000) -> Tab` | Returns a `Tab` scoped to the matched same-origin, nested, or OOPIF `<iframe>`. |
 | `frames()` | `async () -> list[FrameInfo]` | Flattened list of frames (`id`, `parent_id`, `name`, `url`) from `Page.getFrameTree`. |
 | `set_download_dir()` | `async (download_dir: str) -> str` | Configures download folder and returns its canonical absolute path. |

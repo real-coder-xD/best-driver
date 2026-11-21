@@ -50,6 +50,9 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+tls = ["http-tls>=0.6.2"]
+
 [project.urls]
 Homepage = "https://github.com/real-coder-xD/best-driver"
 Documentation = "https://github.com/real-coder-xD/best-driver#readme"
