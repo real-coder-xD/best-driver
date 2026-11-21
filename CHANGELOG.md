@@ -2,6 +2,11 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.1.4] - 2026-11-21
+
+### Documentation
+- Rewrote `README.md` in clean, detailed technical English with zero emoji spam, full API Reference matching all 117 PEP 561 `.pyi` symbols, Smart Locator syntax table, native `backendNodeId` / iframe / download guides, migration snippets (Selenium, Playwright, DrissionPage), measured concurrency throughput, and SEO/GEO FAQ.
+
 ## [0.1.3] - 2026-11-20
 
 ### Architecture & Performance

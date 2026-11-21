@@ -36,7 +36,7 @@ Instead of wrapping `chromedriver` over HTTP or delegating commands to a Node.js
 
 Comparison of architectural design and built-in capabilities (only factual architectural properties and locally verified `best-driver` benchmarks are listed):
 
-| Capability | best-driver (v0.1.3) | DrissionPage | Playwright (Python) | nodriver | Selenium / undetected-chromedriver |
+| Capability | best-driver (v0.1.4) | DrissionPage | Playwright (Python) | nodriver | Selenium / undetected-chromedriver |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | Core runtime | Rust + Tokio (native `cdylib` extension) | Python (sync) | Node.js subprocess + IPC | Python (asyncio) | Python + `chromedriver` binary |
 | Transport protocol | Single flattened CDP WebSocket | Per-tab CDP + HTTP | Flattened CDP via Node IPC | Per-tab CDP WebSocket | W3C WebDriver HTTP |
@@ -53,7 +53,7 @@ Comparison of architectural design and built-in capabilities (only factual archi
 | Cursor & typing physics | Cubic Bezier + biological cadence | Linear / instant | Synthetic / instant | Linear / instant | None |
 | PEP 561 type stubs (`.pyi`) | Full (117/117 symbols + `py.typed`) | Partial | Full | Partial | Full |
 
-### Measured Local Throughput (`best-driver` v0.1.3, Windows 11, Headless Chrome)
+### Measured Local Throughput (`best-driver` v0.1.4, Windows 11, Headless Chrome)
 
 - Browser launch + flattened browser WebSocket ready: **~680 ms**
 - Opening **20 concurrent tabs** (`asyncio.gather` over 1 shared WebSocket): **~295 ms**
