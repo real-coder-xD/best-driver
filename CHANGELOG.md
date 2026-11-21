@@ -2,6 +2,12 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.1.8] - 2026-11-21
+
+### Static Typing & IDE Autocomplete (PEP 561)
+- **Typed `tls_session()` Overloads**: Added `@overload` annotations in `python/best_driver/__init__.pyi` and `python/best_driver/tls.py` binding `async_mode=True` to `http_tls.AsyncSession` and `async_mode=False` to `http_tls.Session`, enabling full IDE autocomplete on both `tls.*` and `resp.*` (`status_code`, `text`, `json`, `headers`, `cookies`, `http_version`, `challenge`, etc.).
+- **Strict `TypedDict` & `Literal` Return Types**: Added `Cookie`, `ElementDict`, and `SpecialKey` types; upgraded `Tab.cookies()`, `Tab.get_cookies()`, `StorageState.cookies`, `Element.to_dict()`, `Tab.press_key()`, and `@overload` typing on `Tab.storage_get()` (`key=None -> dict[str, str]`, `key: str -> Optional[str]`).
+
 ## [0.1.7] - 2026-11-21
 
 ### Documentation

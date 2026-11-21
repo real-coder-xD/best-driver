@@ -7,11 +7,41 @@ Smart Locator syntax accepted across `Tab` and `Element` queries:
 - Attribute shorthand: `@name=username`, `@placeholder=Search`, `@disabled`
 """
 
-from typing import Any, Literal, Optional, Sequence, TypedDict, Union
+from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence, TypedDict, Union, overload
+
+if TYPE_CHECKING:
+    from http_tls import AsyncSession as HttpTlsAsyncSession  # type: ignore[import-not-found]
+    from http_tls import Session as HttpTlsSession  # type: ignore[import-not-found]
+else:
+    HttpTlsAsyncSession = Any
+    HttpTlsSession = Any
 
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "none", "commit"]
 MouseButton = Literal["left", "right", "middle"]
 ImageFormat = Literal["png", "jpeg", "jpg", "webp"]
+SpecialKey = Literal[
+    "Enter",
+    "Return",
+    "Tab",
+    "Escape",
+    "Esc",
+    "Backspace",
+    "Delete",
+    "Del",
+    "Space",
+    "ArrowUp",
+    "Up",
+    "ArrowDown",
+    "Down",
+    "ArrowLeft",
+    "Left",
+    "ArrowRight",
+    "Right",
+    "Home",
+    "End",
+    "PageUp",
+    "PageDown",
+]
 
 
 class ElementRect(TypedDict):
@@ -21,6 +51,35 @@ class ElementRect(TypedDict):
     y: float
     width: float
     height: float
+
+
+ElementDict = TypedDict(
+    "ElementDict",
+    {
+        "tag": str,
+        "text": str,
+        "value": Optional[str],
+        "id": Optional[str],
+        "class": Optional[str],
+        "rect": ElementRect,
+    },
+)
+
+
+class Cookie(TypedDict, total=False):
+    """CDP cookie dictionary returned by `Tab.cookies()` / `Tab.get_cookies()`."""
+
+    name: str
+    value: str
+    domain: str
+    path: str
+    url: str
+    expires: float
+    size: int
+    httpOnly: bool
+    secure: bool
+    session: bool
+    sameSite: Literal["Strict", "Lax", "None"]
 
 
 class NetworkResponse(TypedDict):
@@ -73,7 +132,7 @@ class BrowserFingerprint(TypedDict):
 class StorageState(TypedDict):
     """Playwright / `http_tls`-compatible state exported by `Tab.storage_state`."""
 
-    cookies: list[dict[str, Any]]
+    cookies: list[Cookie]
     origins: list[Any]
     user_agent: Optional[str]
     headers: dict[str, str]
@@ -130,7 +189,7 @@ class Element:
         """Viewport bounding box (`x`, `y`, `width`, `height`)."""
         ...
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> ElementDict:
         """Return captured metadata as a plain Python dictionary."""
         ...
 
@@ -458,7 +517,7 @@ class Tab:
         """Clear `selector` and insert `text` immediately via `Input.insertText`."""
         ...
 
-    async def press_key(self, key: str) -> None:
+    async def press_key(self, key: Union[SpecialKey, str]) -> None:
         """Dispatch a special key (`"Enter"`, `"Tab"`, `"Escape"`, `"Backspace"`, `"ArrowDown"`, ...)."""
         ...
 
@@ -588,15 +647,15 @@ class Tab:
         """Set a single cookie quickly by `name` and `value`."""
         ...
 
-    async def cookies(self, urls: Optional[Sequence[str]] = None) -> list[dict[str, Any]]:
+    async def cookies(self, urls: Optional[Sequence[str]] = None) -> list[Cookie]:
         """Alias for `get_cookies()`."""
         ...
 
-    async def get_cookies(self, urls: Optional[Sequence[str]] = None) -> list[dict[str, Any]]:
+    async def get_cookies(self, urls: Optional[Sequence[str]] = None) -> list[Cookie]:
         """Retrieve browser cookies (optionally filtered by `urls`)."""
         ...
 
-    async def set_cookies(self, cookies: Sequence[dict[str, Any]]) -> None:
+    async def set_cookies(self, cookies: Sequence[Union[Cookie, dict[str, Any]]]) -> None:
         """Inject a list of CDP cookie dictionaries."""
         ...
 
@@ -621,7 +680,22 @@ class Tab:
         """Load and inject cookies from a JSON file and return cookie count."""
         ...
 
-    async def storage_get(self, key: Optional[str] = None, session: bool = False) -> Any:
+    @overload
+    async def storage_get(self, key: None = None, session: bool = False) -> dict[str, str]:
+        """Read all entries from `localStorage` (`session=False`) or `sessionStorage`."""
+        ...
+
+    @overload
+    async def storage_get(self, key: str, session: bool = False) -> Optional[str]:
+        """Read one key from `localStorage` (`session=False`) or `sessionStorage`."""
+        ...
+
+    @overload
+    async def storage_get(
+        self,
+        key: Optional[str] = None,
+        session: bool = False,
+    ) -> Union[dict[str, str], Optional[str]]:
         """Read one key or all entries from `localStorage` (`session=False`) or `sessionStorage`."""
         ...
 
@@ -695,11 +769,26 @@ class Tab:
         """Export all CDP cookies (including `HttpOnly`) and live browser headers in `http_tls`/Playwright format."""
         ...
 
-    async def tls_session(self, async_mode: bool = True, **kwargs: Any) -> Any:
+    @overload
+    async def tls_session(self, async_mode: Literal[True] = True, **kwargs: Any) -> HttpTlsAsyncSession:
+        """Create an `http_tls.AsyncSession` synced with this tab's TLS preset, headers, proxy, and cookies."""
+        ...
+
+    @overload
+    async def tls_session(self, async_mode: Literal[False], **kwargs: Any) -> HttpTlsSession:
+        """Create a synchronous `http_tls.Session` synced with this tab's TLS preset, headers, proxy, and cookies."""
+        ...
+
+    @overload
+    async def tls_session(self, async_mode: bool = True, **kwargs: Any) -> Union[HttpTlsAsyncSession, HttpTlsSession]:
         """Create an `http_tls.AsyncSession` (or `Session`) synced with this tab's TLS preset, headers, proxy, and cookies."""
         ...
 
-    async def sync_from_tls(self, session: Any, default_url: Optional[str] = None) -> int:
+    async def sync_from_tls(
+        self,
+        session: Union[HttpTlsAsyncSession, HttpTlsSession, Any],
+        default_url: Optional[str] = None,
+    ) -> int:
         """Push updated cookies from an `http_tls` session back into this Chromium tab; returns count synced."""
         ...
 
@@ -779,12 +868,33 @@ async def start(
     ...
 
 
-async def tls_session(tab: Tab, async_mode: bool = True, **kwargs: Any) -> Any:
+@overload
+async def tls_session(tab: Tab, async_mode: Literal[True] = True, **kwargs: Any) -> HttpTlsAsyncSession:
+    """Create an `http_tls.AsyncSession` synchronized with `tab`."""
+    ...
+
+
+@overload
+async def tls_session(tab: Tab, async_mode: Literal[False], **kwargs: Any) -> HttpTlsSession:
+    """Create a synchronous `http_tls.Session` synchronized with `tab`."""
+    ...
+
+
+@overload
+async def tls_session(
+    tab: Tab,
+    async_mode: bool = True,
+    **kwargs: Any,
+) -> Union[HttpTlsAsyncSession, HttpTlsSession]:
     """Create an `http_tls.AsyncSession` (or `Session`) synchronized with `tab`."""
     ...
 
 
-async def sync_from_tls(tab: Tab, session: Any, default_url: Optional[str] = None) -> int:
+async def sync_from_tls(
+    tab: Tab,
+    session: Union[HttpTlsAsyncSession, HttpTlsSession, Any],
+    default_url: Optional[str] = None,
+) -> int:
     """Push cookies from an `http_tls` session back into `tab`."""
     ...
 
@@ -792,13 +902,16 @@ async def sync_from_tls(tab: Tab, session: Any, default_url: Optional[str] = Non
 __all__ = [
     "Browser",
     "BrowserFingerprint",
+    "Cookie",
     "DownloadInfo",
     "Element",
+    "ElementDict",
     "ElementRect",
     "FrameInfo",
     "ImageFormat",
     "MouseButton",
     "NetworkResponse",
+    "SpecialKey",
     "StorageState",
     "Tab",
     "WaitUntil",

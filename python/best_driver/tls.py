@@ -11,7 +11,14 @@ BoringSSL session:
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, Union, overload
+
+if TYPE_CHECKING:
+    from http_tls import AsyncSession as HttpTlsAsyncSession  # type: ignore[import-not-found]
+    from http_tls import Session as HttpTlsSession  # type: ignore[import-not-found]
+else:
+    HttpTlsAsyncSession = Any
+    HttpTlsSession = Any
 
 
 def _import_http_tls() -> Any:
@@ -23,6 +30,18 @@ def _import_http_tls() -> Any:
             "Install it with: pip install 'best-driver[tls]' (or pip install http-tls)"
         ) from exc
     return http_tls
+
+
+@overload
+async def from_tab(tab: Any, async_mode: Literal[True] = True, **kwargs: Any) -> HttpTlsAsyncSession: ...
+
+
+@overload
+async def from_tab(tab: Any, async_mode: Literal[False], **kwargs: Any) -> HttpTlsSession: ...
+
+
+@overload
+async def from_tab(tab: Any, async_mode: bool = True, **kwargs: Any) -> Union[HttpTlsAsyncSession, HttpTlsSession]: ...
 
 
 async def from_tab(tab: Any, async_mode: bool = True, **kwargs: Any) -> Any:
