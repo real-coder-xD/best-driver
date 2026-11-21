@@ -264,9 +264,264 @@ pub const NODE_META_FN: &str = "function() { \
     }; \
 }";
 
+// ───────────────────── CDP Pierced DOM Matcher (Closed Shadow Roots) ─────────────────────
+
+fn cdp_attr<'a>(node: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+    let attrs = node.get("attributes")?.as_array()?;
+    let mut i = 0;
+    while i + 1 < attrs.len() {
+        if let Some(k) = attrs[i].as_str() {
+            if k.eq_ignore_ascii_case(name) {
+                return attrs[i + 1].as_str();
+            }
+        }
+        i += 2;
+    }
+    None
+}
+
+fn cdp_collect_text(node: &serde_json::Value, buf: &mut String) {
+    if node.get("nodeType").and_then(|v| v.as_i64()) == Some(3) {
+        if let Some(val) = node.get("nodeValue").and_then(|v| v.as_str()) {
+            buf.push_str(val);
+        }
+        return;
+    }
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for c in children {
+            cdp_collect_text(c, buf);
+        }
+    }
+}
+
+/// Checks whether a CDP `DOM.Node` matches a simple compound selector (`tag`, `#id`, `.cls`, `[attr]`, `[attr=val]`).
+fn matches_simple_css(node: &serde_json::Value, sel: &str) -> bool {
+    if node.get("nodeType").and_then(|v| v.as_i64()) != Some(1) {
+        return false;
+    }
+    let tag_name = node
+        .get("localName")
+        .or_else(|| node.get("nodeName"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    let bytes = sel.as_bytes();
+    let mut i = 0;
+    let mut matched_any = false;
+
+    // Optional leading tag name (e.g. `input`, `button`, `*`)
+    let start = i;
+    while i < bytes.len() && !matches!(bytes[i], b'#' | b'.' | b'[') {
+        i += 1;
+    }
+    if i > start {
+        let want_tag = sel[start..i].trim();
+        if !want_tag.is_empty() && want_tag != "*" && !tag_name.eq_ignore_ascii_case(want_tag) {
+            return false;
+        }
+        matched_any = true;
+    }
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                i += 1;
+                let s = i;
+                while i < bytes.len() && !matches!(bytes[i], b'#' | b'.' | b'[') {
+                    i += 1;
+                }
+                let want_id = &sel[s..i];
+                if cdp_attr(node, "id") != Some(want_id) {
+                    return false;
+                }
+                matched_any = true;
+            }
+            b'.' => {
+                i += 1;
+                let s = i;
+                while i < bytes.len() && !matches!(bytes[i], b'#' | b'.' | b'[') {
+                    i += 1;
+                }
+                let want_cls = &sel[s..i];
+                let has_cls = cdp_attr(node, "class")
+                    .map(|c| c.split_whitespace().any(|tok| tok == want_cls))
+                    .unwrap_or(false);
+                if !has_cls {
+                    return false;
+                }
+                matched_any = true;
+            }
+            b'[' => {
+                i += 1;
+                let s = i;
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                if i >= bytes.len() {
+                    return false;
+                }
+                let inner = sel[s..i].trim();
+                i += 1; // skip ']'
+                if let Some((k, v)) = inner.split_once("*=") {
+                    let k = k.trim();
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    if !cdp_attr(node, k).map(|a| a.contains(v)).unwrap_or(false) {
+                        return false;
+                    }
+                } else if let Some((k, v)) = inner.split_once("^=") {
+                    let k = k.trim();
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    if !cdp_attr(node, k).map(|a| a.starts_with(v)).unwrap_or(false) {
+                        return false;
+                    }
+                } else if let Some((k, v)) = inner.split_once("$=") {
+                    let k = k.trim();
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    if !cdp_attr(node, k).map(|a| a.ends_with(v)).unwrap_or(false) {
+                        return false;
+                    }
+                } else if let Some((k, v)) = inner.split_once('=') {
+                    let k = k.trim();
+                    let v = v.trim().trim_matches('"').trim_matches('\'');
+                    if cdp_attr(node, k) != Some(v) {
+                        return false;
+                    }
+                } else if cdp_attr(node, inner).is_none() {
+                    return false;
+                }
+                matched_any = true;
+            }
+            _ => return false,
+        }
+    }
+    matched_any
+}
+
+/// Walks a `DOM.getDocument({ depth: -1, pierce: true })` tree (including `#shadow-root (closed)`)
+/// and returns matching `backendNodeId`s for CSS, `@attr=val`, or `text:`/`t:` queries.
+pub fn find_pierced_backend_node_ids(root: &serde_json::Value, query: &str) -> Vec<i64> {
+    let s = query.trim();
+    if s.is_empty() || s.starts_with("//") || s.starts_with("(//") || s.starts_with(".//") {
+        return Vec::new();
+    }
+
+    if let Some(txt) = s.strip_prefix("text:").or_else(|| s.strip_prefix("t:")) {
+        let needle = txt.trim().to_lowercase();
+        let mut out = Vec::new();
+        fn walk_text(node: &serde_json::Value, needle: &str, out: &mut Vec<i64>) -> bool {
+            let mut child_matched = false;
+            if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+                for c in children {
+                    if walk_text(c, needle, out) {
+                        child_matched = true;
+                    }
+                }
+            }
+            if let Some(shadows) = node.get("shadowRoots").and_then(|v| v.as_array()) {
+                for sr in shadows {
+                    if walk_text(sr, needle, out) {
+                        child_matched = true;
+                    }
+                }
+            }
+            if let Some(cd) = node.get("contentDocument") {
+                if walk_text(cd, needle, out) {
+                    child_matched = true;
+                }
+            }
+            if child_matched {
+                return true;
+            }
+            if node.get("nodeType").and_then(|v| v.as_i64()) == Some(1) {
+                let mut text = String::new();
+                cdp_collect_text(node, &mut text);
+                if text.trim().to_lowercase().contains(needle) {
+                    if let Some(bid) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
+                        out.push(bid);
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        walk_text(root, &needle, &mut out);
+        return out;
+    }
+
+    let css = if let Some(attr_part) = s.strip_prefix('@') {
+        attr_to_css(attr_part)
+    } else {
+        s.to_string()
+    };
+
+    // Support whitespace-separated descendant selectors (e.g. `form input[type="checkbox"]`)
+    let parts: Vec<&str> = css.split_whitespace().filter(|p| *p != ">").collect();
+    if parts.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    fn walk_css<'a>(
+        node: &'a serde_json::Value,
+        parts: &[&str],
+        ancestors: &mut Vec<&'a serde_json::Value>,
+        out: &mut Vec<i64>,
+    ) {
+        let is_elem = node.get("nodeType").and_then(|v| v.as_i64()) == Some(1);
+        if is_elem && matches_simple_css(node, parts[parts.len() - 1]) {
+            // Verify remaining ancestor selector parts in reverse order
+            let mut need = parts.len() - 1;
+            if need == 0 {
+                if let Some(bid) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
+                    out.push(bid);
+                }
+            } else {
+                for anc in ancestors.iter().rev() {
+                    if matches_simple_css(anc, parts[need - 1]) {
+                        need -= 1;
+                        if need == 0 {
+                            break;
+                        }
+                    }
+                }
+                if need == 0 {
+                    if let Some(bid) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
+                        out.push(bid);
+                    }
+                }
+            }
+        }
+
+        if is_elem {
+            ancestors.push(node);
+        }
+        if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+            for c in children {
+                walk_css(c, parts, ancestors, out);
+            }
+        }
+        if let Some(shadows) = node.get("shadowRoots").and_then(|v| v.as_array()) {
+            for sr in shadows {
+                walk_css(sr, parts, ancestors, out);
+            }
+        }
+        if let Some(cd) = node.get("contentDocument") {
+            walk_css(cd, parts, ancestors, out);
+        }
+        if is_elem {
+            ancestors.pop();
+        }
+    }
+
+    let mut ancestors = Vec::new();
+    walk_css(root, &parts, &mut ancestors, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn attr_to_css_handles_bare_and_quoted_values() {
@@ -298,5 +553,49 @@ mod tests {
         let (f_attr, arg_attr) = child_sel_fn("@data-id=42");
         assert!(f_attr.contains("queryDeep"));
         assert_eq!(arg_attr, "[data-id=\"42\"]");
+    }
+
+    #[test]
+    fn pierced_matcher_finds_nodes_inside_closed_shadow_root() {
+        let doc = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "div",
+                "backendNodeId": 10,
+                "attributes": ["id", "host"],
+                "shadowRoots": [{
+                    "nodeType": 11,
+                    "shadowRootType": "closed",
+                    "children": [{
+                        "nodeType": 1,
+                        "localName": "label",
+                        "backendNodeId": 20,
+                        "attributes": ["class", "cb-wrap active"],
+                        "children": [
+                            {
+                                "nodeType": 1,
+                                "localName": "input",
+                                "backendNodeId": 21,
+                                "attributes": ["id", "cf-cb", "type", "checkbox"]
+                            },
+                            {
+                                "nodeType": 3,
+                                "nodeValue": "Verify you are human"
+                            }
+                        ]
+                    }]
+                }]
+            }]
+        });
+
+        assert_eq!(find_pierced_backend_node_ids(&doc, "#cf-cb"), vec![21]);
+        assert_eq!(find_pierced_backend_node_ids(&doc, "input[type=\"checkbox\"]"), vec![21]);
+        assert_eq!(find_pierced_backend_node_ids(&doc, "@type=checkbox"), vec![21]);
+        assert_eq!(find_pierced_backend_node_ids(&doc, "label.active input#cf-cb"), vec![21]);
+        assert_eq!(find_pierced_backend_node_ids(&doc, "input[id*=\"cf-\"]"), vec![21]);
+        assert_eq!(find_pierced_backend_node_ids(&doc, "input[type^=\"check\"]"), vec![21]);
+        assert_eq!(find_pierced_backend_node_ids(&doc, "input[type$=\"box\"]"), vec![21]);
+        assert_eq!(find_pierced_backend_node_ids(&doc, "text:Verify you are human"), vec![20]);
     }
 }

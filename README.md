@@ -1,16 +1,24 @@
-# best-driver — Undetected Rust-Powered Chromium Automation for Python
+<div align="center">
 
-**High-performance, GIL-free Python browser automation and web scraping built in pure Rust (`PyO3` + `Tokio`) over a single flattened Chrome DevTools Protocol (CDP) WebSocket.**
+# `best-driver`
+
+**Undetected Rust-Powered Chromium Automation for Python**
+
+*High-performance, GIL-free browser automation and web scraping built in pure Rust (`PyO3` + `Tokio`) over a single flattened Chrome DevTools Protocol (CDP) WebSocket.*
 
 [![PyPI version](https://img.shields.io/pypi/v/best-driver?style=flat-square&color=blue)](https://pypi.org/project/best-driver/)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg?style=flat-square)](https://www.python.org/)
 [![Typing](https://img.shields.io/badge/typing-PEP%20561%20typed-007acc.svg?style=flat-square)](https://peps.python.org/pep-0561/)
 [![Rust](https://img.shields.io/badge/rust-2021%20%7C%20PyO3%200.30%20%7C%20Tokio-orange.svg?style=flat-square)](https://www.rust-lang.org/)
+
 [![Sannysoft Headless](https://img.shields.io/badge/sannysoft%20headless-57%2F57%20passed-success.svg?style=flat-square)](https://bot.sannysoft.com)
 [![Wheels](https://img.shields.io/badge/wheels-14%20platforms-brightgreen.svg?style=flat-square)](https://pypi.org/project/best-driver/#files)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](https://github.com/real-coder-xD/best-driver/blob/main/LICENSE)
 
-[Overview](#overview) | [Comparison](#best-driver-vs-playwright-selenium-drissionpage-and-nodriver) | [Installation](#installation) | [Quickstart](#quickstart) | [Smart Locators & Shadow DOM](#smart-locators-and-shadow-dom) | [Element Handles](#element-handles) | [Iframes](#working-with-iframes) | [Network & Downloads](#network-interception-and-downloads) | [Sessions & Proxies](#cookies-storage-profiles-and-proxies) | [Input Physics](#biological-input-physics-and-forms) | [Stealth Architecture](#stealth-and-anti-detection-architecture) | [Error Handling & Typing](#error-handling-and-typing) | [API Reference](#api-reference) | [Architecture](#architecture-under-the-hood) | [Migration Guide](#migration-guide) | [FAQ](#frequently-asked-questions)
+[Overview](#overview) · [Comparison](#best-driver-vs-patchright-nodriver-and-drissionpage) · [Installation](#installation) · [Quickstart](#quickstart) · [Locators & Shadow DOM](#smart-locators-and-shadow-dom) · [Elements](#element-handles) · [Iframes](#working-with-iframes) · [Network & Downloads](#network-interception-and-downloads)<br>
+[Sessions & Proxies](#cookies-storage-profiles-and-proxies) · [Input Physics](#biological-input-physics-and-forms) · [Stealth](#stealth-and-anti-detection-architecture) · [Errors & Typing](#error-handling-and-typing) · [API Reference](#api-reference) · [Architecture](#architecture-under-the-hood) · [Migration](#migration-guide) · [FAQ](#frequently-asked-questions)
+
+</div>
 
 ---
 
@@ -22,42 +30,44 @@ Instead of wrapping `chromedriver` over HTTP or delegating commands to a Node.js
 
 ### Core Design Highlights
 
-- **Single Flattened WebSocket Multiplexer**: One persistent Tokio WebSocket serves all tabs, popups, and OOPIFs via `sessionId` routing. Target discovery and creation use `Target.getTargets` and `Target.createTarget` directly over WebSocket with zero HTTP client crates (`reqwest` and TLS are not in the dependency tree).
-- **GIL-Free Native Async I/O**: JSON-RPC 2.0 framing, WebSocket I/O, Base64 decoding, concurrent `DOM.describeNode` fan-out (`join_all`), and cursor trajectory calculations run natively in Rust on Tokio without holding the Python GIL.
-- **Direct FFI Serialization**: Python primitives (`dict`, `list`, `int`, `float`, `bool`, `str`, `None`) map directly into `serde_json::Value` in Rust without intermediate `json.dumps` allocations.
-- **Headless Stealth Verified at 57/57 on Sannysoft (0 failures, 0 warnings)**: Automatically strips `HeadlessChrome` from HTTP `User-Agent` and `Sec-CH-UA` client hints, patches strictly on DOM prototypes (`Object.getOwnPropertyNames(navigator) == []`), isolates canvas noise via offscreen cloning so transparent probe pixels stay intact, and auto-arms popups and OOPIFs before their first JavaScript statement runs.
-- **Zero-DOM-Mutation Element Handles**: `tab.ele()` and `tab.eles()` bind directly to Chromium's internal `backendNodeId` (`DOM.describeNode` + `DOM.resolveNode`), avoiding synthetic DOM attributes that `MutationObserver` anti-bot scripts flag.
-- **Unified Smart Locators, Shadow DOM & Iframes**: Every selector method resolves CSS, XPath (`//`), visible text (`text:` / `t:`), and attribute shorthands (`@name=q`) while automatically traversing open `#shadow-root` subtrees; `tab.iframe()` provides full control over same-origin, nested, `srcdoc`, and cross-origin OOPIF frames.
-- **100% PEP 561 Typed**: Ships `best_driver/__init__.pyi` (117/117 public symbols verified against the compiled runtime) and `py.typed` for complete autocomplete and static checking in VSCode/Pylance, PyCharm, Mypy, and Pyright.
+- `◈` **Single Flattened WebSocket Multiplexer**: One persistent Tokio WebSocket serves all tabs, popups, and OOPIFs via `sessionId` routing. Target discovery and creation use `Target.getTargets` and `Target.createTarget` directly over WebSocket with zero HTTP client crates (`reqwest` and TLS are not in the dependency tree).
+- `◈` **GIL-Free Native Async I/O**: JSON-RPC 2.0 framing, WebSocket I/O, Base64 decoding, concurrent `DOM.describeNode` fan-out (`join_all`), and cursor trajectory calculations run natively in Rust on Tokio without holding the Python GIL.
+- `◈` **Direct FFI Serialization**: Python primitives (`dict`, `list`, `int`, `float`, `bool`, `str`, `None`) map directly into `serde_json::Value` in Rust without intermediate `json.dumps` allocations.
+- `◈` **Verified Stealth — Zero `Runtime.enable` Leak & 57/57 Sannysoft Headless**: Omits `Runtime.enable` so Cloudflare/DataDome `console.debug` traps return `False`, strips `HeadlessChrome` from `User-Agent` and `Sec-CH-UA`, patches strictly on DOM prototypes (`Object.getOwnPropertyNames(navigator) == []`), isolates canvas noise via offscreen cloning, and auto-arms popups and OOPIFs before their first JavaScript statement runs.
+- `◈` **Zero-DOM-Mutation Element Handles**: `tab.ele()` and `tab.eles()` bind directly to Chromium's internal `backendNodeId` (`DOM.describeNode` + `DOM.resolveNode`), avoiding synthetic DOM attributes that `MutationObserver` anti-bot scripts flag.
+- `◈` **Unified Smart Locators, Open & Closed Shadow DOM, and Iframes**: Every selector method resolves CSS, XPath (`//`), visible text (`text:` / `t:`), and attribute shorthands (`@name=q`), transparently traverses both `mode: 'open'` and `mode: 'closed'` `#shadow-root` subtrees via native CDP `DOM.getDocument(pierce=True)`, and `tab.iframe()` provides full control over same-origin, nested, `srcdoc`, closed-shadow-hosted, and cross-origin OOPIF frames.
+- `◈` **100% PEP 561 Typed**: Ships `best_driver/__init__.pyi` (117/117 public symbols verified against the compiled runtime) and `py.typed` for complete autocomplete and static checking in VSCode/Pylance, PyCharm, Mypy, and Pyright.
 
 ---
 
-## best-driver vs Playwright, Selenium, DrissionPage, and nodriver
+## best-driver vs Patchright, nodriver, and DrissionPage
 
-Comparison of architectural design and built-in capabilities (only factual architectural properties and locally verified `best-driver` benchmarks are listed):
+Comparison against Python browser automation tools commonly used for anti-bot and Cloudflare bypass workflows:
 
-| Capability | best-driver (v0.1.4) | DrissionPage | Playwright (Python) | nodriver | Selenium / undetected-chromedriver |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| Core runtime | Rust + Tokio (native `cdylib` extension) | Python (sync) | Node.js subprocess + IPC | Python (asyncio) | Python + `chromedriver` binary |
-| Transport protocol | Single flattened CDP WebSocket | Per-tab CDP + HTTP | Flattened CDP via Node IPC | Per-tab CDP WebSocket | W3C WebDriver HTTP |
-| External driver dependency | None | None | Bundled Node.js driver | None | `chromedriver` binary |
-| Python GIL impact on I/O | None (native Tokio threads) | GIL-bound | Cross-process IPC pipe | GIL-bound | GIL-bound |
-| Smart locators (`//`, `text:`, `@attr`, CSS) | Built-in, unified across all methods | Built-in, unified | Prefixed (`text=`, `xpath=`) | Basic CSS | Explicit `By.*` enums |
-| Automatic open Shadow DOM piercing | Yes (all locator methods) | Yes | Partial (CSS selectors) | No | Manual JS traversal |
-| Element handle DOM mutation | None (native CDP `backendNodeId`) | Node / locator refs | Internal handles | Raw CDP nodes | WebDriver element IDs |
-| Iframe support | Same-origin, nested, `srcdoc`, OOPIF | Built-in | `frame_locator` | Manual | `switch_to.frame` |
-| Popup & OOPIF pre-execution stealth | Built-in (`Target.setAutoAttach`) | Manual | Not stealth-focused | Manual | None |
-| Network response body capture | `tab.wait_for_response()` | `listen.wait()` | `page.wait_for_response()` | Manual CDP events | External proxy required |
-| Download manager | `tab.wait_for_download()` | Built-in | `page.expect_download()` | Manual | Browser prefs workaround |
-| Built-in headless stealth | 57/57 Sannysoft headless (0 fail, 0 warn) | Basic CDP evasion | Disabled by default | Basic CDP evasion | Binary-patched ChromeDriver (`uc`) |
-| Cursor & typing physics | Cubic Bezier + biological cadence | Linear / instant | Synthetic / instant | Linear / instant | None |
-| PEP 561 type stubs (`.pyi`) | Full (117/117 symbols + `py.typed`) | Partial | Full | Partial | Full |
+| Capability | best-driver | Patchright | nodriver | DrissionPage |
+| :--- | :--- | :--- | :--- | :--- |
+| Core runtime | Rust + Tokio (`cdylib`) | Node.js + Python | Python (`asyncio`) | Python (sync) |
+| Transport | 1 flattened CDP WS | Flattened CDP (IPC) | Per-tab CDP WS | Per-tab CDP + HTTP |
+| External runtime | `✓` None | `✗` Patched Node | `✓` None | `✓` None |
+| GIL on I/O | `✓` Free (Tokio) | `◐` Cross-process IPC | `✗` GIL-bound | `✗` GIL-bound |
+| Stealth strategy | No `Runtime.enable` + prototype JS + UA/CH + Auto-Attach + Bezier | Patched `Runtime.enable` + isolated worlds | Driverless CDP flags | Driverless CDP flags |
+| Smart locators | `✓` Unified (`//`, `text:`, `@attr`, CSS) | `◐` Prefixed (`text=`, `xpath=`) | `◐` Basic CSS / text | `✓` Unified (`//`, `text:`, `@attr`, CSS) |
+| Auto Shadow DOM | `✓` Open + Closed (CDP) | `◐` Open (CSS) | `✗` No | `◐` Open (JS) |
+| Element handles | `✓` `backendNodeId` (0 mutation) | `✓` Locator handles | `◐` Raw CDP nodes | `◐` Node / locator refs |
+| Popup & OOPIF stealth | `✓` Auto (`Target.setAutoAttach`) | `✓` Patched driver | `✗` Manual | `✗` Manual |
+| Iframe / Download / AJAX | `✓` Built-in | `✓` Built-in | `✗` Manual CDP | `✓` Built-in |
+| Input physics | `✓` Cubic Bezier + `human_type` + `swipe` | `✗` Synthetic / instant | `✗` Linear / instant | `✗` Linear / instant |
+| PEP 561 typing | `✓` Full (117/117 + `py.typed`) | `✓` Full | `◐` Partial | `◐` Partial |
 
-### Measured Local Throughput (`best-driver` v0.1.4, Windows 11, Headless Chrome)
+> Legend: `✓` Native / full support · `◐` Partial / indirect · `✗` Not built-in
 
-- Browser launch + flattened browser WebSocket ready: **~680 ms**
-- Opening **20 concurrent tabs** (`asyncio.gather` over 1 shared WebSocket): **~295 ms**
-- Executing **20 concurrent `tab.evaluate()` calls** across all 20 tabs: **~5.4 ms**
+### Measured Local Throughput (Windows 11, Headless Chrome)
+
+| Benchmark | Measured Latency |
+| :--- | ---: |
+| `▸` Browser launch + flattened browser WebSocket ready | **~680 ms** |
+| `▸` Opening **20 concurrent tabs** (`asyncio.gather`, 1 shared WS) | **~295 ms** |
+| `▸` Executing **20 concurrent `tab.evaluate()` calls** across 20 tabs | **~5.4 ms** |
 
 ---
 
@@ -139,9 +149,9 @@ Every query-accepting method on `Tab` (`ele`, `eles`, `click`, `double_click`, `
 | Prefix / Pattern | Resolution Mode | Shadow DOM Piercing | Examples |
 | :--- | :--- | :--- | :--- |
 | `//`, `(//`, `.//` | XPath (`document.evaluate`) | Standard document XPath | `"//button[@type='submit']"`, `"(//li[@class='row'])[1]"`, `".//span"` |
-| `text:` or `t:` | Deepest visible element whose `innerText`, `textContent`, `value`, or `aria-label` contains substring (case-insensitive) | Automatic recursive walk | `"text:Sign In"`, `"t:Confirm order"` |
-| `@attr` or `@attr=value` | CSS attribute selector with automatic escaping of `\` and `"` | Automatic deep traversal | `"@name=email"`, `"@placeholder=Enter password"`, `"@disabled"` |
-| Anything else | Standard CSS selector | Direct query first, then recursive `#shadow-root` traversal | `"#login-btn"`, `".card > a[href]"`, `"input[type='email']"` |
+| `text:` or `t:` | Deepest visible element whose `innerText`, `textContent`, `value`, or `aria-label` contains substring (case-insensitive) | Automatic open + closed (`mode: 'closed'`) via CDP fallback | `"text:Sign In"`, `"t:Confirm order"` |
+| `@attr` or `@attr=value` | CSS attribute selector with automatic escaping of `\` and `"` | Automatic open + closed (`mode: 'closed'`) via CDP fallback | `"@name=email"`, `"@placeholder=Enter password"`, `"@disabled"` |
+| Anything else | Standard CSS selector (`#id`, `.cls`, `tag`, `[attr]`, `[attr*=val]`, descendants) | Direct query first, then open JS walk, then CDP `pierce: true` for closed roots | `"#login-btn"`, `".card > a[href]"`, `"input[type='checkbox']"` |
 
 ### Example
 
@@ -157,11 +167,17 @@ await tab.click("@data-testid=submit-button")
 # Locate by XPath
 first_title = await tab.text("(//article//h2)[1]")
 
-# Locate inside open #shadow-root transparently (no frame or shadow switching needed)
+# Locate inside open OR closed #shadow-root transparently (no frame or shadow switching needed)
 shadow_button = await tab.ele("#button-inside-shadow-root")
 if shadow_button:
     print(await shadow_button.outer_html())
     await shadow_button.click()
+
+# Pierce an iframe hosted inside a closed #shadow-root (mode: 'closed')
+widget_frame = await tab.iframe("iframe[src*='challenges']")
+checkbox = await widget_frame.ele("input[type='checkbox']")
+if checkbox:
+    await checkbox.click()
 
 # Multi-element extraction also pierces Shadow DOM
 total = await tab.count(".shadow-item")
@@ -367,45 +383,47 @@ await tab.swipe(120.0, 340.0, 380.0, 342.0)
 
 ## Stealth and Anti-Detection Architecture
 
-### Six Defense Layers
+### Seven Defense Layers
 
-1. **Headless UA and Client Hints Alignment**: At launch, `BrowserCore` queries `Browser.getVersion`. Whenever `HeadlessChrome/` is present, `Emulation.setUserAgentOverride` is applied across all sessions with synchronized `userAgent` and `userAgentMetadata` (`brands`, `fullVersionList`, `platform`, `platformVersion`, `architecture`, `bitness`) matching the real installed Chrome version and host OS.
-2. **Pre-Execution Auto-Attach for Popups and OOPIFs**: The browser connection runs `Target.setAutoAttach(autoAttach=True, waitForDebuggerOnStart=True, flatten=True)` supervised by a background Tokio task synchronized with per-target `tokio::sync::OnceCell`. Every newly spawned `window.open()` popup or cross-origin OOPIF receives `evasion.js` and the UA override before its first JavaScript instruction runs, then resumes unconditionally via `Runtime.runIfWaitingForDebugger`.
-3. **Prototype-Only Native Patching (`src/evasion.js`)**:
+1. **Zero `Runtime.enable` CDP Leak**: `Tab::new()` intentionally omits `Runtime.enable`. All script evaluations (`Runtime.evaluate`, `Runtime.callFunctionOn`), iframe isolated worlds (`Page.createIsolatedWorld`), and handle cleanup (`Runtime.releaseObject`) operate without activating V8's `Runtime` inspector domain, so `console.debug(new Error())` `Error.stack` getter and object-property serialization traps used by Cloudflare Turnstile and DataDome evaluate to `False`.
+2. **Headless UA and Client Hints Alignment**: At launch, `BrowserCore` queries `Browser.getVersion`. Whenever `HeadlessChrome/` is present, `Emulation.setUserAgentOverride` is applied across all sessions with synchronized `userAgent` and `userAgentMetadata` (`brands`, `fullVersionList`, `platform`, `platformVersion`, `architecture`, `bitness`) matching the real installed Chrome version and host OS.
+3. **Pre-Execution Auto-Attach for Popups and OOPIFs**: The browser connection runs `Target.setAutoAttach(autoAttach=True, waitForDebuggerOnStart=True, flatten=True)` supervised by a background Tokio task synchronized with per-target `tokio::sync::OnceCell`. Every newly spawned `window.open()` popup or cross-origin OOPIF receives `evasion.js` and the UA override before its first JavaScript instruction runs, then resumes unconditionally via `Runtime.runIfWaitingForDebugger`.
+4. **Prototype-Only Native Patching (`src/evasion.js`)**:
    - `Navigator.prototype.webdriver` getter returns `false` with authentic descriptor (`'webdriver' in Navigator.prototype === true`, `configurable: true`, `enumerable: true`).
    - All patched getters and methods live on their real prototypes (`Navigator.prototype`, `Permissions.prototype`, `SpeechSynthesis.prototype`, `MediaDevices.prototype`) using non-constructable concise method syntax (`'prototype' in fn === false`) masked via `Function.prototype.toString` to return `function <name>() { [native code] }`.
    - `Object.getOwnPropertyNames(navigator)` and `Object.getOwnPropertyNames(navigator.permissions)` remain empty (`[]`).
-4. **Zero-DOM-Mutation Locators**: `Element` handles use Chromium's internal `backendNodeId` rather than injecting DOM attributes.
-5. **Safe Canvas, Audio, WebGL, and Environment Consistency**:
+5. **Zero-DOM-Mutation Locators & Closed Shadow DOM Piercing**: `Element` handles bind directly to Chromium's internal `backendNodeId` rather than injecting DOM attributes. When a selector targets nodes inside a `#shadow-root (closed)`, `best-driver` falls back to CDP `DOM.getDocument(pierce=True)` / `DOM.describeNode(pierce=True)` without injecting wrapper scripts into page context.
+6. **Safe Canvas, Audio, WebGL, and Environment Consistency**:
    - WebGL `UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL` spoofed to `Google Inc. (NVIDIA)` / `ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)`.
    - Canvas noise uses a per-session shift applied via an offscreen clone in `toDataURL`, skipping transparent pixels (`alpha === 0`) and small probe canvases (`< 16px`) so live canvases are never mutated and `TRANSPARENT_PIXEL` tests stay `[0, 0, 0, 0]`.
    - AudioContext applies a tiny once-per-buffer salt tracked in a `WeakSet`.
    - Provides realistic fallback entries for `SpeechSynthesis.getVoices()`, `MediaDevices.enumerateDevices()`, `navigator.connection` (`4g`), `PluginArray` / `MimeTypeArray`, `window.chrome`, and `outerWidth` / `outerHeight` window frame offsets when headless omits them.
-6. **Biological Input Physics**: Cubic Bezier cursor arcs, micro-tremors, variable keystroke cadence, and S-curve swipe physics.
+7. **Biological Input Physics**: Cubic Bezier cursor arcs, micro-tremors, variable keystroke cadence, and S-curve swipe physics.
 
 ### Verified Headless Benchmark (`bot.sannysoft.com`)
 
 Verified in `--headless=new` mode (`headless=True`) with strict CSS-class inspection (`failed` and `warn` counts across all 57 rows):
 
 | Check Group | Observed Result | Status |
-| :--- | :--- | :--- |
-| `User Agent (Old)` & `HEADCHR_UA` | `Chrome/<host-version>` (no `HeadlessChrome`) | Passed |
-| `WebDriver (New)` & `WebDriver Advanced` | `missing (passed)` / `passed` | Passed |
-| `Chrome (New)` & `Permissions (New)` | `present (passed)` / `default` | Passed |
-| `Plugins Length` & `PluginArray` type | `5` / `passed` | Passed |
-| `Languages` & `CHR_MEMORY` | `en-US,en` / `ok` | Passed |
-| `WebGL Vendor` & `WebGL Renderer` | `Google Inc. (NVIDIA)` / `RTX 4070 Direct3D11` | Passed |
-| `TRANSPARENT_PIXEL` & `Broken Image Dimensions` | `ok` (`[0, 0, 0, 0]`) / `16x16` | Passed |
-| `HEADCHR_*`, `PHANTOM_*`, `SELENIUM_DRIVER`, `CHR_DEBUG_TOOLS` | `ok` (0 failures) | Passed |
-| `Object.getOwnPropertyNames(navigator)` | `[]` | Passed |
-| `MutationObserver` during `ele()` / `eles()` | `[]` | Passed |
-| **Total Sannysoft Headless Score** | **57 / 57 passed (0 failed, 0 warnings)** | **Passed** |
+| :--- | :--- | :---: |
+| `User Agent (Old)` & `HEADCHR_UA` | `Chrome/<host-version>` (no `HeadlessChrome`) | `✓` Passed |
+| `WebDriver (New)` & `WebDriver Advanced` | `missing (passed)` / `passed` | `✓` Passed |
+| `Chrome (New)` & `Permissions (New)` | `present (passed)` / `default` | `✓` Passed |
+| `Plugins Length` & `PluginArray` type | `5` / `passed` | `✓` Passed |
+| `Languages` & `CHR_MEMORY` | `en-US,en` / `ok` | `✓` Passed |
+| `WebGL Vendor` & `WebGL Renderer` | `Google Inc. (NVIDIA)` / `RTX 4070 Direct3D11` | `✓` Passed |
+| `TRANSPARENT_PIXEL` & `Broken Image Dimensions` | `ok` (`[0, 0, 0, 0]`) / `16x16` | `✓` Passed |
+| `HEADCHR_*`, `PHANTOM_*`, `SELENIUM_DRIVER`, `CHR_DEBUG_TOOLS` | `ok` (0 failures) | `✓` Passed |
+| `Object.getOwnPropertyNames(navigator)` | `[]` | `✓` Passed |
+| `MutationObserver` during `ele()` / `eles()` | `[]` | `✓` Passed |
+| `Runtime.enable` `console.debug(err)` `Error.stack` & object getter traps | `False` / `False` | `✓` Passed |
+| **Total Sannysoft Headless Score** | **57 / 57 passed (0 failed, 0 warnings)** | **`✓` Passed** |
 
 In addition to `bot.sannysoft.com`, live headless verification confirmed DuckDuckGo search submission via `@name=q` + `human_type` and clean page load on `nowsecure.nl` without triggering an interstitial challenge.
 
 ### Known Limitations on Stock Chromium
 
-`best-driver` intentionally runs on stock, unmodified Chromium binaries so users do not have to maintain custom browser builds. Because `Tab::new()` enables the standard CDP `Runtime` domain (`Runtime.enable`), enterprise WAFs that probe V8 `Runtime.enable` console serialization side-channels (such as advanced Kasada or Akamai configurations) can still detect stock CDP sessions.
+`best-driver` intentionally runs on stock, unmodified Chromium binaries so users do not have to maintain custom browser builds. While `Runtime.enable` leaks and closed Shadow DOM barriers are eliminated at the CDP layer, browser-binary-level signals (such as OS font inventory mismatches on minimal Linux containers, datacenter IP reputation, or TLS/JA4 fingerprints) still depend on your host environment and proxy layer rather than a custom-compiled engine like Camoufox.
 
 ---
 
@@ -573,30 +591,33 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 ## Architecture Under the Hood
 
 ```text
-+----------------------------------------------------------+
-|                Python Application (PEP 561)              |
-|        await browser.get("https://...")  + .pyi          |
-+----------------------------+-----------------------------+
-                             | PyO3 0.30 (direct serde Value FFI)
-+----------------------------v-----------------------------+
-|               Rust Core (best_driver.cdylib)             |
-|  +----------------------------------------------------+  |
-|  |             Tokio Asynchronous Runtime             |  |
-|  |  - Single Browser-Level WebSocket (Zero reqwest)   |  |
-|  |  - Flattened SessionId Multiplexer (Target API)    |  |
-|  |  - OnceCell Auto-Attach Stealth (Popups & OOPIFs)  |  |
-|  |  - Native CDP backendNodeId Element Handles        |  |
-|  |  - Cubic Bezier Mouse & Biological Typing Engine   |  |
-|  +-------------------------+--------------------------+  |
-+----------------------------+-----------------------------+
-                             | Single CDP WebSocket (flatten: true)
-+----------------------------v-----------------------------+
-|                     Chromium Engine                      |
-|     (Google Chrome / Brave / Edge / Chromium)            |
-|     - Target.attachToTarget + Target.setAutoAttach       |
-|     - Page.addScriptToEvaluateOnNewDocument (Evasion)    |
-|     - Input / Network / Fetch / DOM / Emulation          |
-+----------------------------------------------------------+
+┌────────────────────────────────────────────────────────────┐
+│                Python Application (PEP 561)                │
+│        await browser.get("https://...")  +  .pyi           │
+└─────────────────────────────┬──────────────────────────────┘
+                              │ PyO3 0.30 (direct serde Value FFI)
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│               Rust Core (best_driver.cdylib)               │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │              Tokio Asynchronous Runtime              │  │
+│  │  ▸ Single Browser-Level WebSocket (Zero reqwest)     │  │
+│  │  ▸ Flattened SessionId Multiplexer (Target API)      │  │
+│  │  ▸ Zero Runtime.enable CDP Leak Architecture         │  │
+│  │  ▸ OnceCell Auto-Attach Stealth (Popups & OOPIFs)    │  │
+│  │  ▸ Native CDP backendNodeId + Closed Shadow Piercing │  │
+│  │  ▸ Cubic Bezier Mouse & Biological Typing Engine     │  │
+│  └──────────────────────────┬───────────────────────────┘  │
+└─────────────────────────────┼──────────────────────────────┘
+                              │ Single CDP WebSocket (flatten: true)
+                              ▼
+┌────────────────────────────────────────────────────────────┐
+│                      Chromium Engine                       │
+│         (Google Chrome / Brave / Edge / Chromium)          │
+│     ▸ Target.attachToTarget + Target.setAutoAttach         │
+│     ▸ Page.addScriptToEvaluateOnNewDocument (Evasion)      │
+│     ▸ Input / Network / Fetch / DOM (pierce) / Emulation   │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ### Rust Source Layout
@@ -605,8 +626,8 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 | :--- | :--- |
 | `src/cdp.rs` | Single browser-level `CdpConnection` WebSocket multiplexer, lightweight `CdpSession` per `sessionId`, and session-filtered `SessionEventRx`. |
 | `src/browser.rs` | Chromium process launcher, pure-Tokio `TcpStream` `/json/version` discovery (`Content-Length` framed), headless UA/Client Hints builder, graceful shutdown + RAII temp profile cleanup. |
-| `src/tab.rs` | Per-tab and per-iframe controller: navigation, waiting, native `backendNodeId` element ops, iframe scoping, download manager, network sniffer, proxy auth, cookies, storage, and capture. |
-| `src/locator.rs` | Smart Locator JS codegen (`sel_expr`, `sel_all_expr`, `child_sel_fn`, `child_sel_all_fn`) with attribute escaping and Shadow DOM traversal. |
+| `src/tab.rs` | Per-tab and per-iframe controller (without `Runtime.enable`): navigation, waiting, native `backendNodeId` element ops, closed Shadow DOM fallback, iframe scoping, download manager, network sniffer, proxy auth, cookies, storage, and capture. |
+| `src/locator.rs` | Smart Locator JS codegen (`sel_expr`, `sel_all_expr`, `child_sel_fn`, `child_sel_all_fn`) plus pure-Rust `find_pierced_backend_node_ids` walker for `#shadow-root (closed)`. |
 | `src/input.rs` | Cubic Bezier cursor trajectory math, S-curve swipe generator, nanosecond jitter, and special keyboard table. |
 | `src/error.rs` | Typed `DriverError` enum mapped to Python `TimeoutError`, `ValueError`, and `RuntimeError`. |
 | `src/evasion.js` | Prototype-only anti-detection script injected via `Page.addScriptToEvaluateOnNewDocument`. |
@@ -681,7 +702,7 @@ No. On startup, `best-driver` reads `Browser.getVersion` and automatically appli
 No. `tab.ele()` and `tab.eles()` bind directly to Chromium's internal `backendNodeId` via `DOM.describeNode` and operate through `DOM.resolveNode` + `Runtime.callFunctionOn`, releasing every V8 `objectId` on all paths. `MutationObserver` detectors observe zero attribute mutations.
 
 ### How does `best-driver` handle Shadow DOM, cross-origin iframes, downloads, and AJAX JSON responses?
-Open `#shadow-root` trees are pierced automatically by all Smart Locator queries; `tab.iframe(selector)` returns a full `Tab` controller for same-origin, nested, `srcdoc`, and cross-origin OOPIF iframes with automatic coordinate translation; `tab.wait_for_download(dir)` captures downloaded files with full metadata; and `tab.wait_for_response(pattern)` waits for `Network.loadingFinished` and returns headers plus the UTF-8 decoded response body.
+Both open (`mode: 'open'`) and closed (`mode: 'closed'`) `#shadow-root` trees are pierced automatically by Smart Locator queries (fast JS path first, with native CDP `DOM.getDocument(pierce=True)` fallback for closed roots); `tab.iframe(selector)` returns a full `Tab` controller for same-origin, nested, `srcdoc`, closed-shadow-hosted, and cross-origin OOPIF iframes with automatic coordinate translation; `tab.wait_for_download(dir)` captures downloaded files with full metadata; and `tab.wait_for_response(pattern)` waits for `Network.loadingFinished` and returns headers plus the UTF-8 decoded response body.
 
 ### Does `best-driver` require `chromedriver` or Node.js?
 No. It requires only Python `>= 3.8` and any locally installed Chromium-based browser (Chrome, Brave, Edge, or Chromium).
@@ -690,5 +711,5 @@ No. It requires only Python `>= 3.8` and any locally installed Chromium-based br
 
 ## Changelog and License
 
-- Release history: [CHANGELOG.md](https://github.com/real-coder-xD/best-driver/blob/main/CHANGELOG.md)
-- License: MIT — see [LICENSE](https://github.com/real-coder-xD/best-driver/blob/main/LICENSE)
+- `▸` Release history: [CHANGELOG.md](https://github.com/real-coder-xD/best-driver/blob/main/CHANGELOG.md)
+- `▸` License: MIT — see [LICENSE](https://github.com/real-coder-xD/best-driver/blob/main/LICENSE)

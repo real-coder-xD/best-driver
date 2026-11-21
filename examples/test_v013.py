@@ -23,6 +23,7 @@ HTML_TEST_PAGE = """<!DOCTYPE html>
         </form>
         <div id="status">Pending</div>
         <div id="shadow-host"></div>
+        <div id="closed-shadow-host"></div>
         <iframe id="demo-frame" style="width:320px;height:120px;border:2px solid #333;" srcdoc="<!DOCTYPE html><html><body><h2 id='frame-title'>Inside Iframe</h2><input id='frame-input' /><button id='frame-btn' onclick=&quot;document.getElementById('frame-out').innerText='Frame: '+document.getElementById('frame-input').value&quot;>Click Frame</button><div id='frame-out'>Idle</div></body></html>"></iframe>
         <a id="dl-link" download="best_driver_test.txt" href="data:text/plain;charset=utf-8,hello%20best%20driver">Download File</a>
     </div>
@@ -30,6 +31,12 @@ HTML_TEST_PAGE = """<!DOCTYPE html>
         const host = document.getElementById('shadow-host');
         const root = host.attachShadow({ mode: 'open' });
         root.innerHTML = '<div class="shadow-inner"><span class="shadow-text">Inside Shadow Root</span><button id="shadow-btn" onclick="this.innerText=\\'Clicked Inside Shadow\\'">Click Shadow</button></div>';
+
+        // Closed shadow root (mode: 'closed') with checkbox + nested iframe
+        window.__closedClicked = false;
+        const closedHost = document.getElementById('closed-shadow-host');
+        const closedRoot = closedHost.attachShadow({ mode: 'closed' });
+        closedRoot.innerHTML = '<label class="cf-label"><input id="closed-cb" type="checkbox" onclick="window.__closedClicked = true" />Verify you are human</label><iframe id="closed-iframe" style="width:200px;height:60px;" srcdoc="<!DOCTYPE html><html><body><span id=\\x27closed-frame-msg\\x27>Inside Closed Shadow Iframe</span></body></html>"></iframe>';
 
         // Watch for ANY unexpected attribute mutations from locator queries (anti-bot MutationObserver probe)
         window.__attrMutations = [];
@@ -228,7 +235,63 @@ async def run_tests():
         os.remove(dl_info["path"])
         os.rmdir(dl_dir)
 
-        print("\n>>> ALL V0.1.3 AUDIT TESTS PASSED (100%) <<<")
+        print("\n--- TEST SUITE 6: Runtime.enable Leak Traps & Closed Shadow DOM ---")
+        # 6a. Cloudflare/DataDome console.debug(Error) stack-getter CDP side-channel trap
+        cdp_traps = await tab.evaluate("""(() => {
+            let errorStackTrap = false;
+            const e = new Error();
+            Object.defineProperty(e, 'stack', {
+                get() {
+                    errorStackTrap = true;
+                    return '';
+                }
+            });
+            console.debug(e);
+
+            let objGetterTrap = false;
+            const probe = {};
+            Object.defineProperty(probe, 'id', {
+                enumerable: true,
+                get() {
+                    objGetterTrap = true;
+                    return 1;
+                }
+            });
+            console.debug(probe);
+            console.log(probe);
+
+            return {
+                errorStackTrap,
+                objGetterTrap,
+                closedHostShadowRootInJs: document.getElementById('closed-shadow-host').shadowRoot
+            };
+        })()""")
+        print(f"  [TRAP] Runtime.enable probe results: {cdp_traps}")
+        assert cdp_traps["errorStackTrap"] is False, "FAILED: Runtime.enable Error.stack trap triggered!"
+        assert cdp_traps["objGetterTrap"] is False, "FAILED: Runtime.enable object getter trap triggered!"
+        assert cdp_traps["closedHostShadowRootInJs"] is None, "Sanity check: closed shadowRoot must be hidden from JS"
+
+        # 6b. Closed Shadow DOM (#shadow-root (closed)) piercing via native CDP DOM.getDocument(pierce=True)
+        assert await tab.exists("#closed-cb") is True
+        cb_text = await tab.text("text:Verify you are human")
+        assert cb_text == "Verify you are human", f"Unexpected closed-shadow text: {cb_text}"
+        cb_list = await tab.eles("input[type='checkbox']")
+        assert len(cb_list) == 1 and cb_list[0].id == "closed-cb"
+        closed_host_el = await tab.ele("#closed-shadow-host")
+        assert closed_host_el is not None
+        cb_el = await closed_host_el.ele("#closed-cb")
+        assert cb_el is not None and cb_el.tag == "input"
+        await cb_el.click()
+        assert await tab.evaluate("window.__closedClicked") is True
+        print(f"[PASS] Closed Shadow DOM pierced & clicked (backend_node_id={cb_el.backend_node_id})")
+
+        # 6c. Iframe nested inside #shadow-root (closed)
+        closed_frame = await tab.iframe("#closed-iframe")
+        closed_frame_msg = await closed_frame.text("#closed-frame-msg")
+        print(f"[PASS] Iframe inside Closed Shadow DOM read -> '{closed_frame_msg}'")
+        assert closed_frame_msg == "Inside Closed Shadow Iframe"
+
+        print("\n>>> ALL V0.1.3+ AUDIT TESTS PASSED (100%) <<<")
     finally:
         await browser.stop()
         assert await browser.is_alive() is False

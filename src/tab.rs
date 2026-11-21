@@ -9,7 +9,10 @@ use tokio::task::JoinHandle;
 use crate::cdp::{CdpSession, SessionEventRx};
 use crate::error::{DriverError, DriverResult};
 use crate::input::{bezier_trajectory, jitter, key_def, swipe_trajectory};
-use crate::locator::{child_sel_all_fn, child_sel_fn, js_str, sel_all_expr, sel_expr, NODE_META_FN};
+use crate::locator::{
+    child_sel_all_fn, child_sel_fn, find_pierced_backend_node_ids, js_str, sel_all_expr, sel_expr,
+    NODE_META_FN,
+};
 
 pub const EVASION_JS: &str = include_str!("evasion.js");
 
@@ -36,8 +39,9 @@ impl Drop for Tab {
 
 impl Tab {
     pub async fn new(target_id: String, cdp: Arc<CdpSession>) -> DriverResult<Self> {
+        // Intentionally omit `Runtime.enable` so V8 never fires console serialization hooks
+        // probed by anti-bot scripts (`console.debug(err)` / `Error.stack` getter traps).
         cdp.call("Page.enable", json!({})).await?;
-        cdp.call("Runtime.enable", json!({})).await?;
         cdp.call("DOM.enable", json!({})).await?;
         cdp.call("Network.enable", json!({})).await?;
 
@@ -242,12 +246,19 @@ impl Tab {
     }
 
     pub async fn exists(&self, selector: &str) -> DriverResult<bool> {
-        Ok(self.evaluate(&format!("{} !== null", sel_expr(selector))).await? == Value::Bool(true))
+        if self.evaluate(&format!("{} !== null", sel_expr(selector))).await? == Value::Bool(true) {
+            return Ok(true);
+        }
+        Ok(!self.pierce_find_ids(selector).await.unwrap_or_default().is_empty())
     }
 
     pub async fn count(&self, selector: &str) -> DriverResult<i64> {
         let v = self.evaluate(&format!("{}.length", sel_all_expr(selector))).await?;
-        Ok(v.as_i64().unwrap_or(0))
+        let n = v.as_i64().unwrap_or(0);
+        if n > 0 {
+            return Ok(n);
+        }
+        Ok(self.pierce_find_ids(selector).await.unwrap_or_default().len() as i64)
     }
 
     pub async fn text(&self, selector: &str) -> DriverResult<Option<String>> {
@@ -255,7 +266,18 @@ impl Tab {
             "(() => {{ const el = {}; return el ? (el.innerText ?? el.textContent ?? '').trim() : null; }})()",
             sel_expr(selector)
         )).await?;
-        Ok(v.as_str().map(str::to_string))
+        if let Some(s) = v.as_str() {
+            return Ok(Some(s.to_string()));
+        }
+        if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+            let txt = self.call_on_node(
+                nid,
+                "function() { return (this.innerText ?? this.textContent ?? '').trim(); }",
+                vec![],
+            ).await?;
+            return Ok(txt.as_str().map(str::to_string));
+        }
+        Ok(None)
     }
 
     pub async fn text_all(&self, selector: &str) -> DriverResult<Vec<String>> {
@@ -477,9 +499,29 @@ impl Tab {
     }
 
     pub async fn click(&self, selector: &str, button: &str, click_count: i64, timeout_ms: u64) -> DriverResult<()> {
-        self.wait_for_selector(selector, timeout_ms, true).await?;
-        let (x, y) = self.element_center(&sel_expr(selector), selector).await?;
-        self.mouse_click(x, y, button, click_count).await
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let visible_expr = format!(
+            "(() => {{ const el = {}; if (!el) return false; const s = getComputedStyle(el); \
+             return s.visibility !== 'hidden' && s.display !== 'none' && el.getClientRects().length > 0; }})()",
+            sel_expr(selector)
+        );
+        loop {
+            if self.evaluate(&visible_expr).await.ok() == Some(Value::Bool(true)) {
+                let (x, y) = self.element_center(&sel_expr(selector), selector).await?;
+                return self.mouse_click(x, y, button, click_count).await;
+            }
+            if let Ok(ids) = self.pierce_find_ids(selector).await {
+                for nid in ids {
+                    if self.click_node(nid, button, click_count).await.is_ok() {
+                        return Ok(());
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(DriverError::Timeout(format!("Chờ phần tử '{}' quá {}ms", selector, timeout_ms)));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Finds the deepest visible element (including inside Shadow DOM) whose text matches `text` and clicks it.
@@ -867,31 +909,87 @@ impl Tab {
         Ok(bytes)
     }
 
-    pub async fn ele(&self, query: &str, timeout_ms: u64) -> DriverResult<Option<(i64, Value)>> {
-        if self.wait_for_selector(query, timeout_ms, false).await.is_err() {
-            return Ok(None);
+    async fn describe_backend_node(&self, backend_node_id: i64) -> DriverResult<(i64, Value)> {
+        let data = self.call_on_node(backend_node_id, NODE_META_FN, vec![]).await?;
+        Ok((backend_node_id, data))
+    }
+
+    /// Walks the CDP pierced DOM tree (including `#shadow-root (closed)`) scoped to the active document or iframe.
+    async fn pierce_find_ids(&self, query: &str) -> DriverResult<Vec<i64>> {
+        if let Some(fid) = self.frame_id() {
+            let owner = self.cdp.call("DOM.getFrameOwner", json!({ "frameId": fid })).await?;
+            let Some(owner_nid) = owner.get("backendNodeId").and_then(|v| v.as_i64()) else {
+                return Ok(Vec::new());
+            };
+            let desc = self.cdp.call("DOM.describeNode", json!({
+                "backendNodeId": owner_nid,
+                "depth": -1,
+                "pierce": true
+            })).await?;
+            let Some(doc) = desc.pointer("/node/contentDocument") else {
+                return Ok(Vec::new());
+            };
+            return Ok(find_pierced_backend_node_ids(doc, query));
         }
-        let res = self.eval_raw(&sel_expr(query), false).await?;
-        let Some(object_id) = res.pointer("/result/objectId").and_then(|v| v.as_str()) else {
-            return Ok(None);
+        let doc = self.cdp.call("DOM.getDocument", json!({
+            "depth": -1,
+            "pierce": true
+        })).await?;
+        let Some(root) = doc.get("root") else {
+            return Ok(Vec::new());
         };
-        Ok(Some(self.describe_and_release_object(object_id).await?))
+        Ok(find_pierced_backend_node_ids(root, query))
+    }
+
+    pub async fn ele(&self, query: &str, timeout_ms: u64) -> DriverResult<Option<(i64, Value)>> {
+        let expr = sel_expr(query);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if let Ok(res) = self.eval_raw(&expr, false).await {
+                if let Some(object_id) = res.pointer("/result/objectId").and_then(|v| v.as_str()) {
+                    return Ok(Some(self.describe_and_release_object(object_id).await?));
+                }
+            }
+            if let Ok(ids) = self.pierce_find_ids(query).await {
+                if let Some(&nid) = ids.first() {
+                    if let Ok(node) = self.describe_backend_node(nid).await {
+                        return Ok(Some(node));
+                    }
+                }
+            }
+            if timeout_ms == 0 || Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     pub async fn eles(&self, query: &str, timeout_ms: u64) -> DriverResult<Vec<(i64, Value)>> {
         let expr = sel_all_expr(query);
-        let start = Instant::now();
-        let timeout = Duration::from_millis(timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             if let Ok(res) = self.eval_raw(&expr, false).await {
                 if let Some(arr_id) = res.pointer("/result/objectId").and_then(|v| v.as_str()) {
                     let nodes = self.extract_array_nodes(arr_id).await?;
-                    if !nodes.is_empty() || timeout_ms == 0 {
+                    if !nodes.is_empty() {
                         return Ok(nodes);
                     }
                 }
             }
-            if start.elapsed() >= timeout {
+            if let Ok(ids) = self.pierce_find_ids(query).await {
+                if !ids.is_empty() {
+                    let futs: Vec<_> = ids.into_iter().map(|nid| self.describe_backend_node(nid)).collect();
+                    let nodes: Vec<_> = futures_util::future::join_all(futs)
+                        .await
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    if !nodes.is_empty() {
+                        return Ok(nodes);
+                    }
+                }
+            }
+            if timeout_ms == 0 || Instant::now() >= deadline {
                 return Ok(Vec::new());
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -909,10 +1007,27 @@ impl Tab {
         })).await;
         self.release_object(&parent_oid).await;
         let res = res?;
-        let Some(child_oid) = res.pointer("/result/objectId").and_then(|v| v.as_str()) else {
-            return Ok(None);
-        };
-        Ok(Some(self.describe_and_release_object(child_oid).await?))
+        if let Some(child_oid) = res.pointer("/result/objectId").and_then(|v| v.as_str()) {
+            return Ok(Some(self.describe_and_release_object(child_oid).await?));
+        }
+        // Fallback: pierce closed shadow roots attached under parent_backend_node_id
+        if let Ok(desc) = self.cdp.call("DOM.describeNode", json!({
+            "backendNodeId": parent_backend_node_id,
+            "depth": -1,
+            "pierce": true
+        })).await {
+            if let Some(node) = desc.get("node") {
+                if let Some(nid) = find_pierced_backend_node_ids(node, query)
+                    .into_iter()
+                    .find(|&id| id != parent_backend_node_id)
+                {
+                    if let Ok(found) = self.describe_backend_node(nid).await {
+                        return Ok(Some(found));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub async fn eles_child(&self, parent_backend_node_id: i64, query: &str) -> DriverResult<Vec<(i64, Value)>> {
@@ -926,28 +1041,56 @@ impl Tab {
         })).await;
         self.release_object(&parent_oid).await;
         let res = res?;
-        let Some(arr_oid) = res.pointer("/result/objectId").and_then(|v| v.as_str()) else {
-            return Ok(Vec::new());
-        };
-        self.extract_array_nodes(arr_oid).await
+        if let Some(arr_oid) = res.pointer("/result/objectId").and_then(|v| v.as_str()) {
+            let nodes = self.extract_array_nodes(arr_oid).await?;
+            if !nodes.is_empty() {
+                return Ok(nodes);
+            }
+        }
+        if let Ok(desc) = self.cdp.call("DOM.describeNode", json!({
+            "backendNodeId": parent_backend_node_id,
+            "depth": -1,
+            "pierce": true
+        })).await {
+            if let Some(node) = desc.get("node") {
+                let ids: Vec<i64> = find_pierced_backend_node_ids(node, query)
+                    .into_iter()
+                    .filter(|&id| id != parent_backend_node_id)
+                    .collect();
+                if !ids.is_empty() {
+                    let futs: Vec<_> = ids.into_iter().map(|nid| self.describe_backend_node(nid)).collect();
+                    return Ok(futures_util::future::join_all(futs).await.into_iter().flatten().collect());
+                }
+            }
+        }
+        Ok(Vec::new())
     }
 
     // ───────────────────────── Iframes & Downloads ─────────────────────────
 
-    /// Locates an `<iframe>` using Smart Locators and returns a scoped `Tab` controller
+    /// Locates an `<iframe>` using Smart Locators (including inside closed shadow roots) and returns a scoped `Tab` controller
     /// (supports same-origin, `srcdoc`, nested iframes, and cross-origin OOPIF targets).
     pub async fn iframe(&self, selector: &str, timeout_ms: u64) -> DriverResult<Tab> {
-        self.wait_for_selector(selector, timeout_ms, false).await?;
-        let res = self.eval_raw(&sel_expr(selector), false).await?;
-        let object_id = res
-            .pointer("/result/objectId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| DriverError::NotFound(format!("Không tìm thấy iframe '{}'", selector)))?
-            .to_string();
-
-        let desc = self.cdp.call("DOM.describeNode", json!({ "objectId": object_id })).await;
-        self.release_object(&object_id).await;
-        let desc = desc?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let expr = sel_expr(selector);
+        let desc = loop {
+            if let Ok(res) = self.eval_raw(&expr, false).await {
+                if let Some(object_id) = res.pointer("/result/objectId").and_then(|v| v.as_str()) {
+                    let d = self.cdp.call("DOM.describeNode", json!({ "objectId": object_id })).await;
+                    self.release_object(object_id).await;
+                    break d?;
+                }
+            }
+            if let Ok(ids) = self.pierce_find_ids(selector).await {
+                if let Some(&nid) = ids.first() {
+                    break self.cdp.call("DOM.describeNode", json!({ "backendNodeId": nid })).await?;
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(DriverError::Timeout(format!("Chờ iframe '{}' quá {}ms", selector, timeout_ms)));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
 
         let fid = desc
             .pointer("/node/frameId")

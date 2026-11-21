@@ -2,6 +2,16 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.1.5] - 2026-11-21
+
+### Stealth & Closed Shadow DOM
+- **Eliminated `Runtime.enable` CDP Leak**: Removed `Runtime.enable` from `Tab::new()` while keeping `Runtime.evaluate`, `Runtime.callFunctionOn`, `Runtime.getProperties`, `Runtime.releaseObject`, and `Page.createIsolatedWorld` fully operational. Verified against Cloudflare/DataDome `console.debug(new Error())` `Error.stack` getter and object-property getter traps (both `False`).
+- **Native CDP Closed Shadow DOM Piercing (`mode: 'closed'`)**: Added pure-Rust `find_pierced_backend_node_ids()` tree walker in `src/locator.rs` (supporting `#id`, `.class`, `tag`, `[attr]`, `[attr=val]`, `[attr*=val]`, `[attr^=val]`, `[attr$=val]`, `@attr=val`, descendant chains, and `text:`/`t:`) backed by automatic `DOM.getDocument(pierce=True)` / `DOM.describeNode(pierce=True)` fallback across `ele`, `eles`, `ele_child`, `eles_child`, `click`, `exists`, `count`, `text`, and `iframe` (including iframes nested inside closed shadow roots).
+- **Expanded Verification Suite**: Added unit test `pierced_matcher_finds_nodes_inside_closed_shadow_root` (10/10 Rust unit tests) and TEST SUITE 6 in `examples/test_v013.py` covering `Runtime.enable` traps, closed shadow checkbox clicking, and closed-shadow-hosted iframe traversal.
+
+### Documentation
+- Refined `README.md` comparison table to focus on anti-bot / Cloudflare-bypass tools (`best-driver`, `Patchright`, `nodriver`, `DrissionPage`) in a compact 5-column PyPI-safe layout with minimal typographic icons (`◈`, `▸`, `✓`, `◐`, `✗`), centered hero header, and Unicode box-drawing architecture diagram.
+
 ## [0.1.4] - 2026-11-21
 
 ### Documentation
