@@ -7,7 +7,7 @@ Smart Locator syntax accepted across `Tab` and `Element` queries:
 - Attribute shorthand: `@name=username`, `@placeholder=Search`, `@disabled`
 """
 
-from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence, TypedDict, Union, overload
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Literal, Optional, Sequence, TypedDict, Union, overload
 
 if TYPE_CHECKING:
     from http_tls import AsyncSession as HttpTlsAsyncSession  # type: ignore[import-not-found]
@@ -792,6 +792,225 @@ class Tab:
         """Push updated cookies from an `http_tls` session back into this Chromium tab; returns count synced."""
         ...
 
+    async def route(self, url_pattern: str, handler: RouteHandler) -> None:
+        """Intercept requests matching `url_pattern` (glob or substring) via CDP Fetch; handler receives `Route`."""
+        ...
+
+    async def unroute(self, url_pattern: Optional[str] = None) -> None:
+        """Remove registered route(s) for `url_pattern` (or all routes when `None`)."""
+        ...
+
+    def listen_responses(self, url_pattern: Optional[str] = None) -> ResponseStream:
+        """Open a live async stream of incoming HTTP responses matching `url_pattern`."""
+        ...
+
+    def listen_requests(self, url_pattern: Optional[str] = None) -> RequestStream:
+        """Open a live async stream of outgoing HTTP requests matching `url_pattern`."""
+        ...
+
+    def locator(self, query: str) -> Locator:
+        """Create a lazy, auto-retrying Smart Locator chain resilient to SPA DOM re-renders."""
+        ...
+
+
+class EventStream:
+    """Low-level Tokio-backed filtered CDP event stream."""
+
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[dict[str, Any]]: ...
+    def close(self) -> None: ...
+
+
+class Route:
+    """Intercepted CDP Fetch request passed to a `tab.route()` handler."""
+
+    request_id: str
+    url: str
+    method: str
+    headers: dict[str, str]
+    post_data: Optional[str]
+    resource_type: str
+    handled: bool
+
+    async def continue_(
+        self,
+        *,
+        url: Optional[str] = None,
+        method: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+        post_data: Optional[Union[str, bytes]] = None,
+    ) -> None:
+        """Continue the intercepted request with optional URL, method, header, or body overrides."""
+        ...
+
+    async def fulfill(
+        self,
+        *,
+        status: int = 200,
+        body: Union[str, bytes] = "",
+        headers: Optional[dict[str, str]] = None,
+        content_type: Optional[str] = None,
+        json: Any = None,
+    ) -> None:
+        """Fulfill the request directly with a synthetic HTTP response (mocking)."""
+        ...
+
+    async def abort(self, error_reason: str = "Failed") -> None:
+        """Abort the intercepted request with a Chromium network error reason."""
+        ...
+
+
+RouteHandler = Callable[[Route], Union[None, Awaitable[None]]]
+
+
+class StreamedRequest:
+    """Outgoing HTTP request yielded by `tab.listen_requests()`."""
+
+    request_id: str
+    url: str
+    method: str
+    headers: dict[str, str]
+    post_data: Optional[str]
+    resource_type: str
+    timestamp: float
+
+
+class StreamedResponse:
+    """Incoming HTTP response yielded by `tab.listen_responses()` with lazy body decoding."""
+
+    request_id: str
+    url: str
+    status: int
+    status_text: str
+    headers: dict[str, str]
+    mime_type: str
+    remote_ip: str
+    protocol: str
+    from_cache: bool
+
+    async def body(self) -> bytes:
+        """Fetch raw response body bytes via `Network.getResponseBody`."""
+        ...
+
+    async def text(self, encoding: str = "utf-8") -> str:
+        """Decode response body as text."""
+        ...
+
+    async def json(self) -> Any:
+        """Parse response body as JSON."""
+        ...
+
+
+class RequestStream(AsyncIterator[StreamedRequest]):
+    """Async stream of outgoing HTTP requests (`async with` + `async for`)."""
+
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[StreamedRequest]: ...
+    def close(self) -> None: ...
+    def __aiter__(self) -> RequestStream: ...
+    async def __anext__(self) -> StreamedRequest: ...
+    async def __aenter__(self) -> RequestStream: ...
+    async def __aexit__(self, *args: Any) -> bool: ...
+
+
+class ResponseStream(AsyncIterator[StreamedResponse]):
+    """Async stream of incoming HTTP responses (`async with` + `async for`)."""
+
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[StreamedResponse]: ...
+    def close(self) -> None: ...
+    def __aiter__(self) -> ResponseStream: ...
+    async def __anext__(self) -> StreamedResponse: ...
+    async def __aenter__(self) -> ResponseStream: ...
+    async def __aexit__(self, *args: Any) -> bool: ...
+
+
+class Locator:
+    """Playwright-style lazy, auto-retrying Smart Locator chain."""
+
+    def locator(self, query: str) -> Locator:
+        """Chain a descendant Smart Locator query (CSS, XPath, `text:`, `@attr`, open/closed Shadow DOM)."""
+        ...
+
+    @property
+    def first(self) -> Locator:
+        """Select the first match (`nth(0)`)."""
+        ...
+
+    @property
+    def last(self) -> Locator:
+        """Select the last match (`nth(-1)`)."""
+        ...
+
+    def nth(self, index: int) -> Locator:
+        """Select the `index`-th match at the current step."""
+        ...
+
+    async def element(self, timeout_ms: int = 10000) -> Optional[Element]: ...
+    async def all(self, timeout_ms: int = 10000) -> list[Element]: ...
+    async def count(self) -> int: ...
+    async def exists(self) -> bool: ...
+    async def wait_for(self, timeout_ms: int = 10000) -> None: ...
+    async def wait_for_hidden(self, timeout_ms: int = 10000) -> None: ...
+    async def click(
+        self,
+        button: MouseButton = "left",
+        click_count: int = 1,
+        timeout_ms: int = 10000,
+    ) -> None: ...
+    async def double_click(self, timeout_ms: int = 10000) -> None: ...
+    async def right_click(self, timeout_ms: int = 10000) -> None: ...
+    async def hover(self, timeout_ms: int = 10000) -> None: ...
+    async def human_type(self, text: str, clear: bool = False, timeout_ms: int = 10000) -> None: ...
+    async def fill(self, text: str, timeout_ms: int = 10000) -> None: ...
+    async def clear(self, timeout_ms: int = 10000) -> None: ...
+    async def text(self, timeout_ms: int = 10000) -> str: ...
+    async def attr(self, name: str, timeout_ms: int = 10000) -> Optional[str]: ...
+    async def value(self, timeout_ms: int = 10000) -> Optional[str]: ...
+    async def inner_html(self, timeout_ms: int = 10000) -> Optional[str]: ...
+    async def outer_html(self, timeout_ms: int = 10000) -> str: ...
+    async def scroll_into_view(self, timeout_ms: int = 10000) -> None: ...
+    async def screenshot(self, file_path: Optional[str] = None, timeout_ms: int = 10000) -> bytes: ...
+
+
+class BrowserContext:
+    """Isolated incognito browser context (separate cookies, storage, and optional proxy) inside one Chromium process."""
+
+    @property
+    def context_id(self) -> str:
+        """Chromium CDP `browserContextId`."""
+        ...
+
+    @property
+    def proxy(self) -> Optional[str]:
+        """Proxy URL bound specifically to this context, or `None`."""
+        ...
+
+    async def main_tab(self) -> Tab:
+        """Return the primary active tab in this context (creating one if none exist)."""
+        ...
+
+    async def new_tab(self, url: str = "about:blank") -> Tab:
+        """Open a new isolated tab inside this `BrowserContext`."""
+        ...
+
+    async def tabs(self) -> list[Tab]:
+        """List all open page tabs belonging to this `BrowserContext`."""
+        ...
+
+    async def get(
+        self,
+        url: str,
+        new_tab: bool = False,
+        wait_until: WaitUntil = "load",
+    ) -> Tab:
+        """Navigate a tab in this context to `url`."""
+        ...
+
+    async def close(self) -> None:
+        """Dispose this `BrowserContext` via `Target.disposeBrowserContext`, wiping its tabs, cookies, and storage."""
+        ...
+
+    async def __aenter__(self) -> BrowserContext: ...
+    async def __aexit__(self, *args: Any) -> bool: ...
+
 
 class Browser:
     """Chromium instance managed over a single flattened browser-level CDP WebSocket."""
@@ -839,6 +1058,14 @@ class Browser:
         wait_until: WaitUntil = "load",
     ) -> Tab:
         """Navigate the main tab (or a new tab when `new_tab=True`) to `url`."""
+        ...
+
+    async def new_context(
+        self,
+        proxy: Optional[str] = None,
+        proxy_bypass_list: Optional[str] = None,
+    ) -> BrowserContext:
+        """Create an isolated incognito `BrowserContext` with separate cookies, storage, and optional per-context proxy."""
         ...
 
     async def stop(self) -> None:
@@ -901,18 +1128,27 @@ async def sync_from_tls(
 
 __all__ = [
     "Browser",
+    "BrowserContext",
     "BrowserFingerprint",
     "Cookie",
     "DownloadInfo",
     "Element",
     "ElementDict",
     "ElementRect",
+    "EventStream",
     "FrameInfo",
     "ImageFormat",
+    "Locator",
     "MouseButton",
     "NetworkResponse",
+    "RequestStream",
+    "ResponseStream",
+    "Route",
+    "RouteHandler",
     "SpecialKey",
     "StorageState",
+    "StreamedRequest",
+    "StreamedResponse",
     "Tab",
     "WaitUntil",
     "start",

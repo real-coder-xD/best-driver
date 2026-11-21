@@ -1619,6 +1619,14 @@ impl Tab {
         Ok(())
     }
 
+    pub fn abort_auth_task(&self) {
+        if let Ok(mut g) = self.auth_task.lock() {
+            if let Some(h) = g.take() {
+                h.abort();
+            }
+        }
+    }
+
     // ───────────────────────────── Fingerprint & TLS Session Handoff ─────────────────────────────
 
     /// Captures the live browser's HTTP/TLS identity (`impersonate`, `user_agent`, `sec_ch_ua*`,

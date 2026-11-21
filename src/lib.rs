@@ -15,7 +15,7 @@ mod locator;
 mod tab;
 
 use browser::{build_headless_ua_override, BrowserProcess};
-use cdp::CdpConnection;
+use cdp::{CdpConnection, SessionEventRx};
 use error::{DriverError, DriverResult};
 use tab::{Tab, EVASION_JS};
 
@@ -132,7 +132,7 @@ macro_rules! fut {
 
 // ───────────────────────────── Browser Core (Single Flattened WebSocket) ─────────────────────────────
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ProxyAuth {
     user: String,
     pass: String,
@@ -356,6 +356,15 @@ impl BrowserCore {
     }
 
     async fn attach(&self, target_id: String) -> DriverResult<Arc<Tab>> {
+        self.attach_with_proxy(target_id, None, None).await
+    }
+
+    async fn attach_with_proxy(
+        &self,
+        target_id: String,
+        proxy_override: Option<String>,
+        proxy_auth_override: Option<ProxyAuth>,
+    ) -> DriverResult<Arc<Tab>> {
         // Reuse auto-attached flattened session if present; otherwise attach via Target.attachToTarget(flatten: true)
         let session_id = match self.sessions_by_target.lock().await.get(&target_id).cloned() {
             Some(sid) => sid,
@@ -390,14 +399,128 @@ impl BrowserCore {
         )
         .await;
 
+        let effective_proxy = proxy_override.or_else(|| self.proxy.clone());
+        let effective_auth = proxy_auth_override.or_else(|| self.proxy_auth.clone());
+
         let session = self.conn.session(session_id);
-        let tab = Tab::new(target_id.clone(), session, self.proxy.clone()).await?;
-        if let Some(a) = &self.proxy_auth {
-            tab.enable_proxy_auth(a.user.clone(), a.pass.clone()).await?;
+        let tab = Tab::new(target_id.clone(), session, effective_proxy).await?;
+        if let Some(a) = effective_auth {
+            tab.enable_proxy_auth(a.user, a.pass).await?;
         }
         let tab = Arc::new(tab);
         self.tabs.lock().await.insert(target_id, Arc::clone(&tab));
         Ok(tab)
+    }
+
+    async fn create_context(
+        &self,
+        proxy: Option<String>,
+        proxy_bypass_list: Option<String>,
+    ) -> DriverResult<(String, Option<String>, Option<ProxyAuth>)> {
+        if self.process.lock().await.is_none() {
+            return Err(DriverError::BrowserClosed);
+        }
+        let mut params = serde_json::Map::new();
+        params.insert("disposeOnDetach".into(), json!(true));
+        let mut ctx_auth = None;
+        let raw_proxy = proxy.clone();
+        if let Some(p) = proxy {
+            let (server, auth) = split_proxy(&p);
+            params.insert("proxyServer".into(), json!(server));
+            ctx_auth = auth;
+        }
+        if let Some(bypass) = proxy_bypass_list {
+            params.insert("proxyBypassList".into(), json!(bypass));
+        }
+        let res = self
+            .conn
+            .call("Target.createBrowserContext", Value::Object(params))
+            .await?;
+        let ctx_id = res
+            .get("browserContextId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DriverError::Connection("Target.createBrowserContext không trả browserContextId".to_string()))?
+            .to_string();
+        Ok((ctx_id, raw_proxy, ctx_auth))
+    }
+
+    async fn new_tab_in_context(
+        &self,
+        ctx_id: &str,
+        url: &str,
+        proxy: Option<String>,
+        proxy_auth: Option<ProxyAuth>,
+    ) -> DriverResult<Arc<Tab>> {
+        if self.process.lock().await.is_none() {
+            return Err(DriverError::BrowserClosed);
+        }
+        let res = self
+            .conn
+            .call(
+                "Target.createTarget",
+                json!({ "url": "about:blank", "browserContextId": ctx_id }),
+            )
+            .await?;
+        let target_id = res
+            .get("targetId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| DriverError::Connection("Target.createTarget không trả targetId".to_string()))?
+            .to_string();
+        let tab = self.attach_with_proxy(target_id, proxy, proxy_auth).await?;
+        if url != "about:blank" {
+            tab.get(url, None, "load").await?;
+        }
+        Ok(tab)
+    }
+
+    async fn list_tabs_in_context(
+        &self,
+        ctx_id: &str,
+        proxy: Option<String>,
+        proxy_auth: Option<ProxyAuth>,
+    ) -> DriverResult<Vec<Arc<Tab>>> {
+        if self.process.lock().await.is_none() {
+            return Err(DriverError::BrowserClosed);
+        }
+        let res = self.conn.call("Target.getTargets", json!({})).await?;
+        let page_ids: Vec<String> = res
+            .get("targetInfos")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter(|t| {
+                        t.get("type").and_then(|v| v.as_str()) == Some("page")
+                            && t.get("browserContextId").and_then(|v| v.as_str()) == Some(ctx_id)
+                    })
+                    .filter_map(|t| t.get("targetId").and_then(|v| v.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut out = Vec::with_capacity(page_ids.len());
+        for tid in page_ids {
+            let cached = self.tabs.lock().await.get(&tid).cloned();
+            match cached {
+                Some(tab) => out.push(tab),
+                None => {
+                    out.push(
+                        self.attach_with_proxy(tid, proxy.clone(), proxy_auth.clone())
+                            .await?,
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    async fn dispose_context(&self, ctx_id: &str) -> DriverResult<()> {
+        self.conn
+            .call(
+                "Target.disposeBrowserContext",
+                json!({ "browserContextId": ctx_id }),
+            )
+            .await
+            .map(|_| ())
     }
 
     /// Page targets via browser WebSocket `Target.getTargets` (zero HTTP polling).
@@ -1352,6 +1475,248 @@ impl PyTab {
         };
         fut!(py, self.inner, |t| t.cdp.call(&method, val).await.map(PyJson))
     }
+
+    // network routing, event streams & lazy auto-retrying locators
+    #[pyo3(signature = (methods=None))]
+    fn _event_stream(&self, methods: Option<Vec<String>>) -> PyEventStream {
+        PyEventStream {
+            rx: Arc::new(Mutex::new(self.inner.cdp.subscribe())),
+            methods: Arc::new(methods),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn _abort_auth_task(&self) {
+        self.inner.abort_auth_task();
+    }
+
+    fn route<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        url_pattern: String,
+        handler: Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.network")?;
+        m.call_method1("add_route", (slf, url_pattern, handler))
+    }
+
+    #[pyo3(signature = (url_pattern=None))]
+    fn unroute<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        url_pattern: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.network")?;
+        m.call_method1("remove_route", (slf, url_pattern))
+    }
+
+    #[pyo3(signature = (url_pattern=None))]
+    fn listen_responses<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        url_pattern: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.network")?;
+        m.call_method1("ResponseStream", (slf, url_pattern))
+    }
+
+    #[pyo3(signature = (url_pattern=None))]
+    fn listen_requests<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        url_pattern: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.network")?;
+        m.call_method1("RequestStream", (slf, url_pattern))
+    }
+
+    fn locator<'py>(slf: Py<Self>, py: Python<'py>, query: String) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.locator")?;
+        m.call_method1("Locator", (slf, vec![query]))
+    }
+}
+
+// ───────────────────────────── EventStream ─────────────────────────────
+
+#[pyclass(name = "EventStream")]
+pub struct PyEventStream {
+    rx: Arc<Mutex<SessionEventRx>>,
+    methods: Arc<Option<Vec<String>>>,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[pymethods]
+impl PyEventStream {
+    #[pyo3(signature = (timeout_ms=None))]
+    fn next<'py>(&self, py: Python<'py>, timeout_ms: Option<u64>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = Arc::clone(&self.rx);
+        let methods = Arc::clone(&self.methods);
+        let closed = Arc::clone(&self.closed);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let deadline = timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+            let mut guard = rx.lock().await;
+            loop {
+                if closed.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(PyJson(Value::Null));
+                }
+                let ev = if let Some(dl) = deadline {
+                    let now = std::time::Instant::now();
+                    if now >= dl {
+                        return Ok(PyJson(Value::Null));
+                    }
+                    match tokio::time::timeout(dl - now, guard.recv()).await {
+                        Ok(r) => r,
+                        Err(_) => return Ok(PyJson(Value::Null)),
+                    }
+                } else {
+                    guard.recv().await
+                };
+                match ev {
+                    Ok((method, params)) => {
+                        let matched = match methods.as_ref() {
+                            Some(list) => list.iter().any(|m| m == &method),
+                            None => true,
+                        };
+                        if matched {
+                            return Ok(PyJson(json!({ "method": method, "params": params })));
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return Ok(PyJson(Value::Null)),
+                }
+            }
+        })
+    }
+
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// ───────────────────────────── BrowserContext ─────────────────────────────
+
+#[pyclass(name = "BrowserContext")]
+pub struct PyBrowserContext {
+    browser: Arc<BrowserCore>,
+    context_id: String,
+    proxy: Option<String>,
+    proxy_auth: Option<ProxyAuth>,
+}
+
+#[pymethods]
+impl PyBrowserContext {
+    fn __repr__(&self) -> String {
+        format!("<BrowserContext id={} proxy={:?}>", self.context_id, self.proxy)
+    }
+
+    #[getter]
+    fn context_id(&self) -> String {
+        self.context_id.clone()
+    }
+
+    #[getter]
+    fn proxy(&self) -> Option<String> {
+        self.proxy.clone()
+    }
+
+    #[pyo3(signature = (url="about:blank".to_string()))]
+    fn new_tab<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
+        let b = Arc::clone(&self.browser);
+        let cid = self.context_id.clone();
+        let proxy = self.proxy.clone();
+        let auth = self.proxy_auth.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            b.new_tab_in_context(&cid, &url, proxy, auth)
+                .await
+                .map(|t| PyTab { inner: t })
+                .map_err(rt)
+        })
+    }
+
+    fn main_tab<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let b = Arc::clone(&self.browser);
+        let cid = self.context_id.clone();
+        let proxy = self.proxy.clone();
+        let auth = self.proxy_auth.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tabs = b.list_tabs_in_context(&cid, proxy.clone(), auth.clone()).await.map_err(rt)?;
+            match tabs.into_iter().next() {
+                Some(t) => Ok(PyTab { inner: t }),
+                None => b
+                    .new_tab_in_context(&cid, "about:blank", proxy, auth)
+                    .await
+                    .map(|t| PyTab { inner: t })
+                    .map_err(rt),
+            }
+        })
+    }
+
+    fn tabs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let b = Arc::clone(&self.browser);
+        let cid = self.context_id.clone();
+        let proxy = self.proxy.clone();
+        let auth = self.proxy_auth.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            b.list_tabs_in_context(&cid, proxy, auth)
+                .await
+                .map(|v| v.into_iter().map(|t| PyTab { inner: t }).collect::<Vec<_>>())
+                .map_err(rt)
+        })
+    }
+
+    #[pyo3(signature = (url, new_tab=false, wait_until="load".to_string()))]
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        new_tab: bool,
+        wait_until: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let b = Arc::clone(&self.browser);
+        let cid = self.context_id.clone();
+        let proxy = self.proxy.clone();
+        let auth = self.proxy_auth.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tab = if new_tab {
+                b.new_tab_in_context(&cid, "about:blank", proxy, auth).await.map_err(rt)?
+            } else {
+                let existing = b.list_tabs_in_context(&cid, proxy.clone(), auth.clone()).await.map_err(rt)?;
+                match existing.into_iter().next() {
+                    Some(t) => t,
+                    None => b.new_tab_in_context(&cid, "about:blank", proxy, auth).await.map_err(rt)?,
+                }
+            };
+            tab.get(&url, None, &wait_until).await.map_err(rt)?;
+            Ok(PyTab { inner: tab })
+        })
+    }
+
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let b = Arc::clone(&self.browser);
+        let cid = self.context_id.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            b.dispose_context(&cid).await.map_err(rt)
+        })
+    }
+
+    fn __aenter__<'py>(slf: Bound<'py, Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let obj: Py<PyAny> = slf.into_any().unbind();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(obj) })
+    }
+
+    #[pyo3(signature = (*_args))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        _args: &Bound<'py, pyo3::types::PyTuple>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let b = Arc::clone(&self.browser);
+        let cid = self.context_id.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let _ = b.dispose_context(&cid).await;
+            Ok::<bool, PyErr>(false)
+        })
+    }
 }
 
 // ───────────────────────────── Browser ─────────────────────────────
@@ -1427,6 +1792,28 @@ impl PyBrowser {
         .await)
     }
 
+    #[pyo3(signature = (proxy=None, proxy_bypass_list=None))]
+    fn new_context<'py>(
+        &self,
+        py: Python<'py>,
+        proxy: Option<String>,
+        proxy_bypass_list: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let b = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (cid, raw_proxy, auth) = b
+                .create_context(proxy, proxy_bypass_list)
+                .await
+                .map_err(rt)?;
+            Ok(PyBrowserContext {
+                browser: b,
+                context_id: cid,
+                proxy: raw_proxy,
+                proxy_auth: auth,
+            })
+        })
+    }
+
     fn stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         fut!(py, self.inner, |c| {
             c.stop().await;
@@ -1476,8 +1863,10 @@ fn start<'py>(
 #[pymodule]
 fn best_driver(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBrowser>()?;
+    m.add_class::<PyBrowserContext>()?;
     m.add_class::<PyTab>()?;
     m.add_class::<PyElement>()?;
+    m.add_class::<PyEventStream>()?;
     m.add_function(wrap_pyfunction!(start, m)?)?;
     Ok(())
 }

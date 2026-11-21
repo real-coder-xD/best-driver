@@ -197,7 +197,8 @@ Comparison against Python browser automation tools commonly used for anti-bot an
 | Stealth strategy | No `Runtime.enable` + prototype JS + UA/CH + Auto-Attach + Bezier | Patched `Runtime.enable` + isolated worlds | Driverless CDP flags | Driverless CDP flags |
 | Smart locators | `✓` Unified (`//`, `text:`, `@attr`, CSS) | `◐` Prefixed (`text=`, `xpath=`) | `◐` Basic CSS / text | `✓` Unified (`//`, `text:`, `@attr`, CSS) |
 | Auto Shadow DOM | `✓` Open + Closed (CDP) | `◐` Open (CSS) | `✗` No | `◐` Open (JS) |
-| Element handles | `✓` `backendNodeId` (0 mutation) | `✓` Locator handles | `◐` Raw CDP nodes | `◐` Node / locator refs |
+| Element handles | `✓` `backendNodeId` + lazy `locator()` | `✓` Locator handles | `◐` Raw CDP nodes | `◐` Node / locator refs |
+| Isolated contexts & routing | `✓` `new_context()` + `route()` + streams | `✓` Built-in | `✗` Manual CDP | `◐` `listen` only |
 | Popup & OOPIF stealth | `✓` Auto (`Target.setAutoAttach`) | `✓` Patched driver | `✗` Manual | `✗` Manual |
 | Synced TLS HTTP handoff | `✓` Native `tab.tls_session()` (`http_tls`) | `✗` Manual | `✗` Manual | `◐` `SessionPage` (OpenSSL) |
 | Iframe / Download / AJAX | `✓` Built-in | `✓` Built-in | `✗` Manual CDP | `✓` Built-in |
@@ -348,6 +349,18 @@ if card is not None:
     await card.click()
 ```
 
+### Lazy Auto-Retrying `Locator` Chains (`tab.locator()`)
+
+On dynamic React, Vue, or Next.js pages that re-render DOM subtrees frequently, use `tab.locator(query)` instead of a snapshot `Element`. A `Locator` stores the chained query and re-resolves lazily on every action (piercing both open and closed `#shadow-root` trees), automatically retrying transient `StaleElement` detachments:
+
+```python
+target_btn = tab.locator("#feed").locator(".card").nth(1).locator("button.like")
+await target_btn.click()  # re-queries fresh & retries automatically if React re-renders mid-click
+
+# Works identically across closed Shadow DOM
+await tab.locator("#closed-host").locator("#closed-btn").click()
+```
+
 ---
 
 ## Working with Iframes
@@ -382,7 +395,41 @@ code_text = await inner.text("#challenge-code")
 
 Async methods in `best-driver` are backed by `pyo3_async_runtimes::tokio::future_into_py`. Calling a method like `tab.wait_for_response(...)` or `tab.wait_for_download(...)` returns an `asyncio.Future` that **starts executing on Tokio immediately** — you do not need (and should not pass it to) `asyncio.create_task()`. Store the future, trigger the browser action, then `await` the future.
 
-### Sniffing AJAX / JSON Responses (`wait_for_response`)
+### Request Interception, Mocking & Header Modification (`tab.route()`)
+
+Intercept outgoing requests matching glob or substring patterns via CDP `Fetch`, then call `route.fulfill(...)` (mock JSON/HTML), `route.continue_(headers=...)` (modify URL/method/headers/body), or `route.abort(...)`:
+
+```python
+async def mock_api(route):
+    await route.fulfill(status=200, json={"ok": True, "source": "mocked"})
+
+async def inject_auth(route):
+    headers = dict(route.headers)
+    headers["X-Trace-Id"] = "best-driver"
+    await route.continue_(headers=headers)
+
+await tab.route("*/api/mocked*", mock_api)
+await tab.route("*api.example.com/*", inject_auth)
+await tab.route("*.png", lambda r: r.abort("BlockedByClient"))
+
+# Remove one pattern or all routes
+await tab.unroute("*.png")
+await tab.unroute()
+```
+
+### Continuous Async Network Streams (`listen_requests()` & `listen_responses()`)
+
+Stream every matching outgoing request or incoming response continuously using `async with` / `async for` (with lazy `await resp.body()`, `await resp.text()`, and `await resp.json()` decoding):
+
+```python
+async with tab.listen_responses("*/api/*") as stream:
+    await tab.click("#load-feed")
+    resp = await stream.next(timeout_ms=10000)
+    if resp is not None:
+        print(resp.status, resp.url, await resp.json())
+```
+
+### Sniffing a Single AJAX / JSON Response (`wait_for_response`)
 
 `tab.wait_for_response(url_pattern, timeout_ms=30000)` subscribes to the tab's filtered CDP event stream, matches `Network.responseReceived` where `url` contains `url_pattern`, waits on the same stream for `Network.loadingFinished` (or `Network.loadingFailed`) for that `requestId` so large payloads finish transferring, and calls `Network.getResponseBody` (automatically decoding UTF-8 base64 payloads).
 
@@ -454,6 +501,24 @@ await tab.storage_set("theme", "dark", session=False)
 val = await tab.storage_get("theme", session=False)
 all_items = await tab.storage_get(None, session=False)
 await tab.storage_clear(session=False)
+```
+
+### Isolated Incognito Contexts (`browser.new_context()`)
+
+Run multiple fully isolated sessions (separate cookies, `localStorage`, and optional per-context authenticated proxy) inside **one shared Chromium process and one WebSocket** via CDP `Target.createBrowserContext`:
+
+```python
+async with await best_driver.start(headless=True) as browser:
+    async with (
+        await browser.new_context(proxy="http://user1:pass1@proxy1:8080") as ctx_a,
+        await browser.new_context(proxy="http://user2:pass2@proxy2:8080") as ctx_b,
+    ):
+        tab_a, tab_b = await asyncio.gather(
+            ctx_a.get("https://example.com"),
+            ctx_b.get("https://example.com"),
+        )
+        # Cookies, localStorage, and proxies are 100% isolated between ctx_a and ctx_b
+        # tab_a.tls_session() automatically inherits ctx_a's proxy!
 ```
 
 ### Persistent User Profiles and Graceful Shutdown
@@ -606,8 +671,17 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 | `new_tab()` | `async (url: str = "about:blank") -> Tab` | Opens a new tab via `Target.createTarget` with evasion armed before navigation. |
 | `tabs()` | `async () -> list[Tab]` | Lists all open `page` targets via `Target.getTargets`. |
 | `get()` | `async (url: str, new_tab: bool = False, wait_until: WaitUntil = "load") -> Tab` | Navigates the main tab (or a new tab if `new_tab=True`) to `url`. |
+| `new_context()` | `async (proxy: Optional[str] = None, proxy_bypass_list: Optional[str] = None) -> BrowserContext` | Creates an isolated incognito context with separate cookies, storage, and optional per-context proxy. |
 | `stop()` | `async () -> None` | Sends graceful `Browser.close` (up to 1.5s wait), then kills and reaps the child process. |
 | Context manager | `async with await best_driver.start() as browser:` | Automatically calls `await browser.stop()` on block exit. |
+
+### `BrowserContext`
+
+| Member | Signature / Type | Description |
+| :--- | :--- | :--- |
+| `context_id`, `proxy` | `str` / `Optional[str]` (properties) | CDP `browserContextId` and optional per-context proxy URL. |
+| `main_tab()` / `new_tab()` / `tabs()` / `get()` | Same signatures as `Browser` | Opens and manages isolated tabs scoped strictly to this context. |
+| `close()` / `async with` | `async () -> None` | Disposes context via `Target.disposeBrowserContext`, wiping its tabs, cookies, and storage. |
 
 ---
 
@@ -641,8 +715,11 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 | `frame_id`, `proxy` | `Optional[str]` (properties) | Frame ID if scoped to an in-process iframe; inherited browser proxy URL. |
 | `fingerprint()` | `async () -> BrowserFingerprint` | Captures live `impersonate`, `user_agent`, `sec_ch_ua*`, `accept_language`, `headers`, `header_order`, and `proxy`. |
 | `storage_state()` | `async (path: Optional[str] = None) -> StorageState` | Exports all CDP cookies (including `HttpOnly`) and live browser headers in Playwright / `http_tls` format. |
-| `tls_session()` | `async (async_mode: bool = True, **kwargs) -> Any` | Creates an `http_tls.AsyncSession` (or `Session`) synced with this tab's fingerprint, proxy, headers, and cookies. |
-| `sync_from_tls()` | `async (session: Any, default_url: Optional[str] = None) -> int` | Pushes updated cookies from an `http_tls` session back into this Chromium tab. |
+| `tls_session()` | `async (async_mode: bool = True, **kwargs) -> HttpTlsAsyncSession \| HttpTlsSession` | Creates a typed `http_tls.AsyncSession` (or `Session`) synced with this tab's fingerprint, proxy, headers, and cookies. |
+| `sync_from_tls()` | `async (session, default_url: Optional[str] = None) -> int` | Pushes updated cookies from an `http_tls` session back into this Chromium tab. |
+| `locator()` | `(query: str) -> Locator` | Returns a lazy, auto-retrying chained `Locator` (`first`, `last`, `nth`, `locator`). |
+| `route()` / `unroute()` | `async (url_pattern, handler)` / `async (url_pattern=None)` | Intercepts, mocks (`fulfill`), modifies (`continue_`), or aborts (`abort`) requests via CDP Fetch. |
+| `listen_requests()` / `listen_responses()` | `(url_pattern: Optional[str] = None) -> RequestStream \| ResponseStream` | Opens a continuous live async stream of matching HTTP requests or responses. |
 | `iframe()` | `async (selector: str, timeout_ms: int = 10000) -> Tab` | Returns a `Tab` scoped to the matched same-origin, nested, or OOPIF `<iframe>`. |
 | `frames()` | `async () -> list[FrameInfo]` | Flattened list of frames (`id`, `parent_id`, `name`, `url`) from `Page.getFrameTree`. |
 | `set_download_dir()` | `async (download_dir: str) -> str` | Configures download folder and returns its canonical absolute path. |

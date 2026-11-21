@@ -2,6 +2,15 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.2.0] - 2026-11-21
+
+### Network Control, Isolated Concurrency & Auto-Retrying Locators
+- **Isolated `BrowserContext` (`browser.new_context(proxy=None, proxy_bypass_list=None)`)**: Creates fully isolated incognito browser contexts via CDP `Target.createBrowserContext` inside a single Chromium process and single WebSocket — with independent cookies, `localStorage`, and optional per-context authenticated proxies (`ctx_tab.tls_session()` automatically inherits the context's proxy). Supports `async with` automatic disposal via `Target.disposeBrowserContext`.
+- **Full Request Routing (`tab.route()`, `tab.unroute()`)**: Intercepts requests matching glob or substring patterns via CDP `Fetch`, supporting both sync and `async def` handlers with `route.fulfill(status, body, json, headers)`, `route.continue_(url, method, headers, post_data)`, and `route.abort(error_reason)` while preserving proxy auth (`Fetch.authRequired`) and auto-continuing unhandled pauses.
+- **Continuous Async Network Streams (`tab.listen_requests()`, `tab.listen_responses()`)**: Backed by a Rust Tokio-filtered `EventStream`, yields `StreamedRequest` and `StreamedResponse` (with lazy `await resp.body()` / `text()` / `json()`) via `async with` / `async for` / `await stream.next(timeout_ms)`.
+- **Lazy Auto-Retrying `Locator` (`tab.locator(query)`)**: Playwright-style chained Smart Locators (`locator()`, `.first`, `.last`, `.nth(i)`) that re-resolve fresh on every interaction (including across open and closed `#shadow-root` trees) and automatically retry transient `StaleElement` errors on re-rendering React/Vue/Next.js SPAs.
+- **Full PEP 561 Stub Parity & Verification**: Added complete `.pyi` stubs across `Browser`, `BrowserContext`, `Tab`, `Element`, `EventStream`, `Locator`, `Route`, `RequestStream`, `ResponseStream`, `StreamedRequest`, and `StreamedResponse`, plus end-to-end verification in `examples/test_v020.py`.
+
 ## [0.1.8] - 2026-11-21
 
 ### Static Typing & IDE Autocomplete (PEP 561)
