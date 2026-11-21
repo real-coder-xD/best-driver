@@ -2,6 +2,11 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.1.7] - 2026-11-21
+
+### Documentation
+- Restructured `README.md` for 30-second developer onboarding: moved `Quickstart` (core browser + 1-line `http_tls` handoff) to the top, promoted `Synchronized http_tls Session Handoff` to a dedicated top-level section & TOC entry with a 6-layer parity table, `asyncio.gather` concurrent burst example, `storage_state.json` save/reload guide, 4-method cheat sheet, and Chrome 131–149 `JA4` pinning note.
+
 ## [0.1.6] - 2026-11-21
 
 ### Synchronized `http_tls` Fingerprint & Session Handoff (`best-driver[tls]`)

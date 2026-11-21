@@ -15,34 +15,178 @@
 [![Wheels](https://img.shields.io/badge/wheels-14%20platforms-brightgreen.svg?style=flat-square)](https://pypi.org/project/best-driver/#files)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](https://github.com/real-coder-xD/best-driver/blob/main/LICENSE)
 
-[Overview](#overview) · [Comparison](#best-driver-vs-patchright-nodriver-and-drissionpage) · [Installation](#installation) · [Quickstart](#quickstart) · [Locators & Shadow DOM](#smart-locators-and-shadow-dom) · [Elements](#element-handles) · [Iframes](#working-with-iframes) · [Network & Downloads](#network-interception-and-downloads)<br>
-[Sessions & Proxies](#cookies-storage-profiles-and-proxies) · [Input Physics](#biological-input-physics-and-forms) · [Stealth](#stealth-and-anti-detection-architecture) · [Errors & Typing](#error-handling-and-typing) · [API Reference](#api-reference) · [Architecture](#architecture-under-the-hood) · [Migration](#migration-guide) · [FAQ](#frequently-asked-questions)
+[Quickstart](#quickstart) · [http_tls Handoff](#synchronized-http_tls-session-handoff) · [Overview](#overview) · [Comparison](#best-driver-vs-patchright-nodriver-and-drissionpage) · [Installation](#installation) · [Locators & Shadow DOM](#smart-locators-and-shadow-dom) · [Elements](#element-handles) · [Iframes](#working-with-iframes)<br>
+[Network & Downloads](#network-interception-and-downloads) · [Sessions & Proxies](#cookies-storage-profiles-and-proxies) · [Input Physics](#biological-input-physics-and-forms) · [Stealth](#stealth-and-anti-detection-architecture) · [Errors & Typing](#error-handling-and-typing) · [API Reference](#api-reference) · [Architecture](#architecture-under-the-hood) · [FAQ](#frequently-asked-questions)
 
 </div>
 
 ---
 
+## Quickstart
+
+### 1. Install
+
+```bash
+# Core browser automation engine (14 pre-built wheel targets, zero external runtime)
+pip install best-driver
+
+# Optional: include the synchronized Rust BoringSSL HTTP client bridge (http-tls)
+pip install "best-driver[tls]"
+```
+
+### 2. Run Your First Undetected Browser
+
+```python
+import asyncio
+import best_driver
+
+
+async def main() -> None:
+    async with await best_driver.start(headless=True) as browser:
+        tab = await browser.get("https://bot.sannysoft.com", wait_until="networkidle")
+
+        print("Title:", await tab.title())
+        print("navigator.webdriver:", await tab.evaluate("navigator.webdriver"))  # False
+
+        # Smart Locator (CSS, XPath //, text:, @attr=val — pierces open & closed Shadow DOM)
+        heading = await tab.ele("h1")
+        if heading is not None:
+            print("Heading:", heading.tag, heading.text)
+
+        await tab.screenshot("sannysoft.png", full_page=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### 3. Hand Off the Live Session to `http_tls` (1 Line)
+
+Open a page once in real Chromium, then switch to `http_tls` (`~200-346 req/s`) sharing the exact same proxy/IP family, `HTTP/2`, TLS ciphers/extensions, `User-Agent`, `Sec-CH-UA*`, 13-header wire order, and `HttpOnly` cookies:
+
+```python
+import asyncio
+import best_driver
+
+
+async def main() -> None:
+    async with await best_driver.start(headless=True) as browser:
+        tab = await browser.get("https://www.cloudflare.com/cdn-cgi/trace", wait_until="load")
+
+        # 1 line: sync proxy/IPv6-IPv4, TLS/H2 preset, headers, header order & HttpOnly cookies
+        async with await tab.tls_session() as tls:
+            resp = await tls.get("https://www.cloudflare.com/cdn-cgi/trace")
+            print(resp.status_code, resp.http_version)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+## Synchronized `http_tls` Session Handoff
+
+Use `best-driver` for JavaScript rendering and browser session setup, then call `await tab.tls_session()` to run high-throughput API requests through `http_tls` (Rust BoringSSL `wreq`) without paying Chromium memory overhead on every request.
+
+### What Gets Synchronized Automatically
+
+| Layer | How `best-driver` Syncs It to `http_tls` |
+| :--- | :--- |
+| `▸` **Outbound IP / Proxy** | Inherits `browser.proxy` verbatim; when no proxy is set, inspects CDP `remoteIPAddress` and auto-binds `local_address="::"` (IPv6) or `"0.0.0.0"` (IPv4) so dual-stack hosts see the exact same IP. |
+| `▸` **Transport Protocol** | Launches Chromium with `--disable-quic` by default so both Chromium and `http_tls` negotiate `HTTP/2` over TCP. |
+| `▸` **TLS Ciphers & Extensions** | Auto-maps live browser version & OS (`chrome_157`, `chrome_149_macos`, `edge_148`) and disables `TLSTrustAnchorIDs` (`0xca34`) by default so all 15 ciphers (`8daaf6152771`) and 16 standard TLS extensions align. |
+| `▸` **Akamai HTTP/2 & Header Order** | Enforces Chromium's exact `13`-header HTTP/2 wire sequence (`sec-ch-ua` ... `accept-encoding`, `accept-language`, `priority`). |
+| `▸` **`User-Agent` & Client Hints** | Copies live `User-Agent`, `Sec-CH-UA`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Platform`, and `Accept-Language` verbatim. |
+| `▸` **Cookies (Including `HttpOnly`)** | Injects all CDP cookies directly into `http_tls`'s domain-scoped Rust cookie jar (zero cross-domain cookie leakage), and pushes refreshed or host-only cookies back into Chromium via `await tab.sync_from_tls(tls)`. |
+
+> **Tip for 100% Exact `JA4` Parity:** Modern Chrome 156+ hardcodes post-quantum `mldsa44/65/87` signature algorithms in `JA4_R`. If a strict endpoint pins the exact 12-char `JA4` suffix per session, point `browser_path` at a pinned Chrome for Testing `131-149` binary so `JA4` matches `http_tls` (`t13d1516h2_8daaf6152771_d8a2da3f94cd`) byte-for-byte.
+
+### Concurrent Burst + Bi-Directional Cookie Sync
+
+```python
+import asyncio
+import best_driver
+
+
+async def main() -> None:
+    async with await best_driver.start(
+        headless=True,
+        # proxy="http://user:pass@proxy.example.com:8080",
+    ) as browser:
+        tab = await browser.get("https://httpbin.org/cookies", wait_until="load")
+
+        async with await tab.tls_session(async_mode=True) as tls:
+            # Fire concurrent requests over the synced Rust BoringSSL session
+            resps = await asyncio.gather(
+                tls.get("https://httpbin.org/cookies"),
+                tls.get("https://httpbin.org/cookies/set?refreshed=ok_2026"),
+            )
+            print("Statuses:", [r.status_code for r in resps])
+
+            # Push newly issued cookies back into the live Chromium tab
+            synced = await tab.sync_from_tls(tls)
+            print("Synced back to Chromium:", synced)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Save Session to Disk and Reuse Without Reopening Chrome
+
+```python
+import asyncio
+import best_driver
+import http_tls
+
+
+async def export_state() -> str:
+    async with await best_driver.start(headless=True) as browser:
+        tab = await browser.get("https://httpbin.org/cookies/set?token=abc123", wait_until="load")
+        state = await tab.storage_state("session_state.json")
+        return state["impersonate"]
+
+
+preset = asyncio.run(export_state())
+
+# Later: run directly in http_tls (sync or async) with zero browser RAM
+with http_tls.Session(storage_state="session_state.json", impersonate=preset) as s:
+    print(s.get("https://httpbin.org/cookies").json())
+```
+
+### Bridge Methods Cheat Sheet
+
+| Method | Purpose |
+| :--- | :--- |
+| `await tab.fingerprint()` | Returns live `impersonate`, `user_agent`, `sec_ch_ua*`, `accept_language`, `headers`, `header_order`, `proxy`, `remote_ip`, `local_address`. |
+| `await tab.storage_state(path=None)` | Exports all CDP cookies (including `HttpOnly`) + live browser headers in `http_tls` / Playwright JSON format. |
+| `await tab.tls_session(async_mode=True, **kwargs)` | Returns an `http_tls.AsyncSession` (or sync `Session`) pre-configured with all 6 synchronized layers. |
+| `await tab.sync_from_tls(tls, default_url=None)` | Pushes refreshed or host-only cookies from `http_tls` back into the live Chromium tab. |
+
+---
+
 ## Overview
 
-`best-driver` is an open-source, driverless Chromium automation engine for Python built as a native Rust extension (`cdylib`). It is designed as a fast, low-memory, stealth-first alternative to Playwright, Selenium, DrissionPage, nodriver, and undetected-chromedriver.
+`best-driver` is an open-source, driverless Chromium automation engine for Python built as a native Rust extension (`cdylib`). It is designed as a fast, low-memory, stealth-first alternative to Playwright, Patchright, DrissionPage, nodriver, and Selenium.
 
 Instead of wrapping `chromedriver` over HTTP or delegating commands to a Node.js subprocess, `best-driver` launches Chrome, Chromium, Brave, or Microsoft Edge directly and multiplexes all tabs, popups, and out-of-process iframes (OOPIFs) over a **single browser-level CDP WebSocket** using flattened sessions (`Target.attachToTarget` with `flatten: true`).
 
 ### Core Design Highlights
 
-- `◈` **Single Flattened WebSocket Multiplexer**: One persistent Tokio WebSocket serves all tabs, popups, and OOPIFs via `sessionId` routing. Target discovery and creation use `Target.getTargets` and `Target.createTarget` directly over WebSocket with zero HTTP client crates (`reqwest` and TLS are not in the dependency tree).
-- `◈` **GIL-Free Native Async I/O**: JSON-RPC 2.0 framing, WebSocket I/O, Base64 decoding, concurrent `DOM.describeNode` fan-out (`join_all`), and cursor trajectory calculations run natively in Rust on Tokio without holding the Python GIL.
-- `◈` **Direct FFI Serialization**: Python primitives (`dict`, `list`, `int`, `float`, `bool`, `str`, `None`) map directly into `serde_json::Value` in Rust without intermediate `json.dumps` allocations.
+- `◈` **Single Flattened WebSocket Multiplexer**: One persistent Tokio WebSocket serves all tabs, popups, and OOPIFs via `sessionId` routing with zero HTTP client crates (`reqwest` and TLS are not in the dependency tree).
+- `◈` **GIL-Free Native Async I/O**: JSON-RPC 2.0 framing, WebSocket I/O, Base64 decoding, concurrent `DOM.describeNode` fan-out (`join_all`), and cursor trajectory math run natively in Rust on Tokio outside the Python GIL.
 - `◈` **Verified Stealth — Zero `Runtime.enable` Leak & 57/57 Sannysoft Headless**: Omits `Runtime.enable` so Cloudflare/DataDome `console.debug` traps return `False`, strips `HeadlessChrome` from `User-Agent` and `Sec-CH-UA`, patches strictly on DOM prototypes (`Object.getOwnPropertyNames(navigator) == []`), isolates canvas noise via offscreen cloning, and auto-arms popups and OOPIFs before their first JavaScript statement runs.
-- `◈` **Zero-DOM-Mutation Element Handles**: `tab.ele()` and `tab.eles()` bind directly to Chromium's internal `backendNodeId` (`DOM.describeNode` + `DOM.resolveNode`), avoiding synthetic DOM attributes that `MutationObserver` anti-bot scripts flag.
-- `◈` **Unified Smart Locators, Open & Closed Shadow DOM, and Iframes**: Every selector method resolves CSS, XPath (`//`), visible text (`text:` / `t:`), and attribute shorthands (`@name=q`), transparently traverses both `mode: 'open'` and `mode: 'closed'` `#shadow-root` subtrees via native CDP `DOM.getDocument(pierce=True)`, and `tab.iframe()` provides full control over same-origin, nested, `srcdoc`, closed-shadow-hosted, and cross-origin OOPIF frames.
-- `◈` **100% PEP 561 Typed**: Ships `best_driver/__init__.pyi` (117/117 public symbols verified against the compiled runtime) and `py.typed` for complete autocomplete and static checking in VSCode/Pylance, PyCharm, Mypy, and Pyright.
+- `◈` **Zero-DOM-Mutation Element Handles**: `tab.ele()` and `tab.eles()` bind directly to Chromium's internal `backendNodeId`, leaving zero synthetic attributes for `MutationObserver` detectors.
+- `◈` **Unified Smart Locators, Open & Closed Shadow DOM, and Iframes**: Resolves CSS, XPath (`//`), visible text (`text:` / `t:`), and attribute shorthands (`@name=q`) across both `mode: 'open'` and `mode: 'closed'` `#shadow-root` trees, plus same-origin, nested, `srcdoc`, closed-shadow-hosted, and OOPIF iframes.
+- `◈` **Synchronized `http_tls` Handoff**: Built-in 1-line bridge (`tab.tls_session()`) to move seamlessly between real Chromium and Rust BoringSSL HTTP requests.
+- `◈` **100% PEP 561 Typed**: Ships `best_driver/__init__.pyi` (100% parity with the compiled runtime) and `py.typed` for complete IDE autocomplete and static checking.
 
 ---
 
 ## best-driver vs Patchright, nodriver, and DrissionPage
 
-Comparison against Python browser automation tools commonly used for anti-bot and Cloudflare bypass workflows:
+Comparison against Python browser automation tools commonly used for anti-bot and Cloudflare workflows:
 
 | Capability | best-driver | Patchright | nodriver | DrissionPage |
 | :--- | :--- | :--- | :--- | :--- |
@@ -55,9 +199,10 @@ Comparison against Python browser automation tools commonly used for anti-bot an
 | Auto Shadow DOM | `✓` Open + Closed (CDP) | `◐` Open (CSS) | `✗` No | `◐` Open (JS) |
 | Element handles | `✓` `backendNodeId` (0 mutation) | `✓` Locator handles | `◐` Raw CDP nodes | `◐` Node / locator refs |
 | Popup & OOPIF stealth | `✓` Auto (`Target.setAutoAttach`) | `✓` Patched driver | `✗` Manual | `✗` Manual |
+| Synced TLS HTTP handoff | `✓` Native `tab.tls_session()` (`http_tls`) | `✗` Manual | `✗` Manual | `◐` `SessionPage` (OpenSSL) |
 | Iframe / Download / AJAX | `✓` Built-in | `✓` Built-in | `✗` Manual CDP | `✓` Built-in |
 | Input physics | `✓` Cubic Bezier + `human_type` + `swipe` | `✗` Synthetic / instant | `✗` Linear / instant | `✗` Linear / instant |
-| PEP 561 typing | `✓` Full (117/117 + `py.typed`) | `✓` Full | `◐` Partial | `◐` Partial |
+| PEP 561 typing | `✓` Full (`py.typed`) | `✓` Full | `◐` Partial | `◐` Partial |
 
 > Legend: `✓` Native / full support · `◐` Partial / indirect · `✗` Not built-in
 
@@ -68,6 +213,7 @@ Comparison against Python browser automation tools commonly used for anti-bot an
 | `▸` Browser launch + flattened browser WebSocket ready | **~680 ms** |
 | `▸` Opening **20 concurrent tabs** (`asyncio.gather`, 1 shared WS) | **~295 ms** |
 | `▸` Executing **20 concurrent `tab.evaluate()` calls** across 20 tabs | **~5.4 ms** |
+| `▸` 10 concurrent Cloudflare edge requests via `tab.tls_session()` | **45.8 ms (218 req/s)** |
 
 ---
 
@@ -78,14 +224,14 @@ Comparison against Python browser automation tools commonly used for anti-bot an
 - Python `>= 3.8` (CPython 3.8-3.14 and PyPy supported).
 - A locally installed Chromium-based browser: Google Chrome, Chromium, Brave, or Microsoft Edge.
 
-### Install Pre-Built Wheels (Recommended)
+### Pre-Built Wheels (14 Platforms)
 
 Pre-built wheels are published to PyPI for **14 targets** (Windows x64/x86/ARM64, Linux manylinux x86_64/x86/aarch64/armv7, Musllinux x86_64/x86/aarch64/armv7, macOS Intel/Apple Silicon) plus source distribution:
 
 ```bash
 pip install best-driver
 
-# Optional: include the synchronized Rust BoringSSL HTTP client bridge (http-tls)
+# With synchronized Rust BoringSSL HTTP client (http-tls)
 pip install "best-driver[tls]"
 ```
 
@@ -93,11 +239,11 @@ pip install "best-driver[tls]"
 
 When `browser_path=None`, `best_driver.start()` searches standard installation locations in order before falling back to `PATH` (`chrome`, `chromium`, `google-chrome`, `msedge`):
 
-- **Windows**: `Program Files` / `Program Files (x86)` / `%LOCALAPPDATA%` for Google Chrome, Brave, and Microsoft Edge.
-- **macOS**: `/Applications/Google Chrome.app`, `/Applications/Brave Browser.app`, `/Applications/Microsoft Edge.app`.
-- **Linux**: `chrome`, `chromium`, `google-chrome`, `msedge` via `PATH`.
+- `▸` **Windows**: `Program Files` / `Program Files (x86)` / `%LOCALAPPDATA%` for Google Chrome, Brave, and Microsoft Edge.
+- `▸` **macOS**: `/Applications/Google Chrome.app`, `/Applications/Brave Browser.app`, `/Applications/Microsoft Edge.app`.
+- `▸` **Linux**: `chrome`, `chromium`, `google-chrome`, `msedge` via `PATH`.
 
-Pass `browser_path="/custom/path/to/chrome"` to target a specific binary.
+Pass `browser_path="/custom/path/to/chrome"` to target a specific binary (for example, a pinned Chrome for Testing build).
 
 ### Build from Source
 
@@ -109,36 +255,6 @@ cd best-driver
 pip install maturin
 maturin build --release
 pip install --force-reinstall target/wheels/*.whl
-```
-
----
-
-## Quickstart
-
-```python
-import asyncio
-import best_driver
-
-
-async def main() -> None:
-    async with await best_driver.start(headless=True) as browser:
-        tab = await browser.get("https://bot.sannysoft.com", wait_until="networkidle")
-
-        print("Title:", await tab.title())
-        print("URL:", await tab.url())
-        print("navigator.webdriver:", await tab.evaluate("navigator.webdriver"))  # False
-        print("Has HeadlessChrome UA:", "HeadlessChrome" in await tab.evaluate("navigator.userAgent"))  # False
-
-        # Smart locator returning a native CDP Element handle
-        heading = await tab.ele("h1")
-        if heading is not None:
-            print("Heading:", heading.tag, heading.text, heading.rect)
-
-        await tab.screenshot("sannysoft.png", full_page=True)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 ```
 
 ---
@@ -363,31 +479,7 @@ browser = await best_driver.start(
 )
 ```
 
-### Synchronized `http_tls` Session Handoff (Shared Fingerprint & Cookies)
-
-When `http-tls` is installed (`pip install "best-driver[tls]"`), `await tab.tls_session()` hands off the active Chromium session to a high-throughput Rust BoringSSL `http_tls.AsyncSession` (or sync `Session`) while synchronizing all five wire-level identity layers:
-
-1. **Outbound Proxy**: Inherits `browser.proxy` verbatim.
-2. **TLS & HTTP/2 Preset**: Automatically maps Chromium's live version and OS (e.g. `chrome_157`, `chrome_149_macos`, `edge_148`) so cipher suites and Akamai HTTP/2 frames align.
-3. **Exact Headers & Client Hints**: Transfers live `User-Agent`, `Sec-CH-UA`, `Sec-CH-UA-Mobile`, `Sec-CH-UA-Platform`, and `Accept-Language`.
-4. **Exact HTTP/2 Wire Header Order**: Enforces Chromium's 13-header wire sequence (`sec-ch-ua` ... `accept-encoding`, `accept-language`, `priority`).
-5. **Bi-Directional Cookie Jar (Including `HttpOnly`)**: Pulls all CDP cookies via `tab.storage_state()` into `http_tls`, and pushes refreshed or host-only cookies back into Chromium via `await tab.sync_from_tls(tls)`.
-
-```python
-async with await best_driver.start(headless=True, proxy="http://user:pass@host:8080") as browser:
-    tab = await browser.get("https://example.com", wait_until="networkidle")
-
-    # 1 line: create an http_tls.AsyncSession sharing proxy, TLS/H2 preset, headers, order & HttpOnly cookies
-    async with await tab.tls_session() as tls:
-        resp = await tls.get("https://example.com/api/items")
-        print(resp.status_code, resp.json())
-
-        # Push any newly issued server cookies back into the live Chromium tab
-        await tab.sync_from_tls(tls)
-
-    # Export Playwright / http_tls compatible storage_state.json at any time
-    state = await tab.storage_state("session_state.json")
-```
+For handing off the active session (including proxy, IP family, cookies, and TLS/HTTP2 headers) to `http_tls`, see [Synchronized `http_tls` Session Handoff](#synchronized-http_tls-session-handoff).
 
 ---
 
