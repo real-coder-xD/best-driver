@@ -2,8 +2,8 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
 
@@ -241,12 +241,16 @@ async fn arm_target_once(
     .await;
 }
 
+type ContextConfigMap = Arc<Mutex<HashMap<String, (Option<String>, Option<ProxyAuth>, ContextOptions)>>>;
+
 pub struct BrowserCore {
     process: Mutex<Option<BrowserProcess>>,
     conn: Arc<CdpConnection>,
     tabs: Arc<Mutex<HashMap<String, Arc<Tab>>>>,
     sessions_by_target: Arc<Mutex<HashMap<String, String>>>,
     armed_targets: ArmedMap,
+    crashed_sessions: Arc<Mutex<HashSet<String>>>,
+    context_configs: ContextConfigMap,
     headless_ua: Option<Value>,
     proxy: Option<String>,
     proxy_auth: Option<ProxyAuth>,
@@ -323,6 +327,8 @@ impl BrowserCore {
         let sessions_by_target: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let armed_targets: ArmedMap = Arc::new(Mutex::new(HashMap::new()));
+        let crashed_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let context_configs: ContextConfigMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Subscribe BEFORE enabling Target.setAutoAttach so no early child target event is missed
         let mut rx = conn.subscribe();
@@ -330,6 +336,7 @@ impl BrowserCore {
         let tabs_sup = Arc::clone(&tabs);
         let sessions_sup = Arc::clone(&sessions_by_target);
         let armed_sup = Arc::clone(&armed_targets);
+        let crashed_sup = Arc::clone(&crashed_sessions);
         let ua_sup = headless_ua.clone();
 
         let auto_attach_task = tokio::spawn(async move {
@@ -356,6 +363,18 @@ impl BrowserCore {
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string();
+                        let opener_id = ev
+                            .params
+                            .pointer("/targetInfo/openerId")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        let bcid = ev
+                            .params
+                            .pointer("/targetInfo/browserContextId")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
                         let waiting = ev
                             .params
                             .get("waitingForDebugger")
@@ -379,12 +398,33 @@ impl BrowserCore {
                                     .call_raw(Some(&sid), "Runtime.runIfWaitingForDebugger", json!({}))
                                     .await;
                             }
+                            // Notify popup waiters ONLY after stealth arming + debugger resume finish
+                            if ttype == "page" && !tid.is_empty() {
+                                if let Some(opener) = opener_id {
+                                    conn_c.emit_internal(
+                                        "_internal.popupReady",
+                                        json!({
+                                            "targetInfo": {
+                                                "targetId": tid,
+                                                "openerId": opener,
+                                                "browserContextId": bcid,
+                                            }
+                                        }),
+                                    );
+                                }
+                            }
                         });
+                    }
+                    "Inspector.targetCrashed" => {
+                        if let Some(sid) = ev.session_id {
+                            crashed_sup.lock().await.insert(sid);
+                        }
                     }
                     "Target.detachedFromTarget" => {
                         if let Some(sid) = ev.params.get("sessionId").and_then(|v| v.as_str()) {
                             sessions_sup.lock().await.retain(|_, v| v != sid);
                             tabs_sup.lock().await.retain(|_, t| t.session_id() != sid);
+                            crashed_sup.lock().await.remove(sid);
                         }
                     }
                     "Target.targetDestroyed" => {
@@ -417,6 +457,8 @@ impl BrowserCore {
             tabs,
             sessions_by_target,
             armed_targets,
+            crashed_sessions,
+            context_configs,
             headless_ua,
             proxy: raw_proxy,
             proxy_auth,
@@ -597,7 +639,57 @@ impl BrowserCore {
         Ok(out)
     }
 
+    async fn attach_discovered_target(
+        &self,
+        target_id: String,
+        browser_context_id: Option<String>,
+    ) -> DriverResult<Arc<Tab>> {
+        if self.process.lock().await.is_none() {
+            return Err(DriverError::BrowserClosed);
+        }
+        if let Some(cached) = self.tabs.lock().await.get(&target_id).cloned() {
+            return Ok(cached);
+        }
+        let ctx_cfg = match browser_context_id.as_deref() {
+            Some(cid) => self.context_configs.lock().await.get(cid).cloned(),
+            None => None,
+        };
+        let (proxy_override, auth_override, opts) = match ctx_cfg {
+            Some((p, a, o)) => (p, a, Some(o)),
+            None => (None, None, None),
+        };
+        let effective_cid = if opts.is_some() { browser_context_id } else { None };
+        let tab = self
+            .attach_with_context(target_id, proxy_override, auth_override, effective_cid)
+            .await?;
+        if let Some(o) = opts {
+            let _ = o.apply_to_tab(&tab).await;
+        }
+        Ok(tab)
+    }
+
+    async fn is_tab_alive(&self, target_id: &str, session_id: &str) -> bool {
+        if !self.is_alive().await {
+            return false;
+        }
+        if self.crashed_sessions.lock().await.contains(session_id) {
+            return false;
+        }
+        match self.conn.call("Target.getTargets", json!({})).await {
+            Ok(res) => res
+                .get("targetInfos")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .any(|t| t.get("targetId").and_then(|v| v.as_str()) == Some(target_id))
+                })
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     async fn dispose_context(&self, ctx_id: &str) -> DriverResult<()> {
+        self.context_configs.lock().await.remove(ctx_id);
         self.conn
             .call(
                 "Target.disposeBrowserContext",
@@ -696,6 +788,8 @@ impl BrowserCore {
             sessions.clear();
         }
         self.armed_targets.lock().await.clear();
+        self.crashed_sessions.lock().await.clear();
+        self.context_configs.lock().await.clear();
         // Ask Chromium to close gracefully first so persistent profiles flush SQLite/Cookies cleanly
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(1500),
@@ -922,6 +1016,7 @@ impl PyElement {
 #[pyclass(name = "Tab")]
 pub struct PyTab {
     inner: Arc<Tab>,
+    browser: Option<Weak<BrowserCore>>,
 }
 
 #[pymethods]
@@ -1037,10 +1132,11 @@ impl PyTab {
         selector: String,
         timeout_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let browser = self.browser.clone();
         fut!(py, self.inner, |t| t
             .iframe(&selector, timeout_ms)
             .await
-            .map(|f| PyTab { inner: Arc::new(f) }))
+            .map(|f| PyTab { inner: Arc::new(f), browser }))
     }
 
     fn frames<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -1653,6 +1749,18 @@ impl PyTab {
         fut!(py, self.inner, |t| t.cdp.call(&method, val).await.map(PyJson))
     }
 
+    fn is_alive<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let b = self.browser.as_ref().and_then(|w| w.upgrade());
+        let tid = self.inner.target_id.clone();
+        let sid = self.inner.session_id().to_string();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match b {
+                Some(core) => Ok::<bool, PyErr>(core.is_tab_alive(&tid, &sid).await),
+                None => Ok(false),
+            }
+        })
+    }
+
     // network routing, event streams & lazy auto-retrying locators
     #[pyo3(signature = (methods=None))]
     fn _event_stream(&self, methods: Option<Vec<String>>) -> PyEventStream {
@@ -1661,6 +1769,70 @@ impl PyTab {
             methods: Arc::new(methods),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    fn _popup_event_stream(&self) -> PyEventStream {
+        PyEventStream {
+            rx: Arc::new(Mutex::new(
+                self.inner.cdp.subscribe_popups(self.inner.target_id.clone()),
+            )),
+            methods: Arc::new(None),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    #[pyo3(signature = (target_id, browser_context_id=None))]
+    fn _attach_target<'py>(
+        &self,
+        py: Python<'py>,
+        target_id: String,
+        browser_context_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let Some(core) = self.browser.as_ref().and_then(|w| w.upgrade()) else {
+            return Err(rt(DriverError::BrowserClosed));
+        };
+        let browser = self.browser.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            core.attach_discovered_target(target_id, browser_context_id)
+                .await
+                .map(|t| PyTab { inner: t, browser })
+                .map_err(rt)
+        })
+    }
+
+    #[pyo3(signature = (timeout_ms=30000))]
+    fn expect_popup<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        timeout_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.events")?;
+        m.call_method1("PopupExpectation", (slf, timeout_ms))
+    }
+
+    fn listen_popups<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.events")?;
+        m.call_method1("PopupStream", (slf,))
+    }
+
+    #[pyo3(signature = (types=None))]
+    fn listen_console<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        types: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.events")?;
+        m.call_method1("ConsoleStream", (slf, types))
+    }
+
+    fn listen_page_errors<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.events")?;
+        m.call_method1("PageErrorStream", (slf,))
+    }
+
+    fn listen_crashes<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.events")?;
+        m.call_method1("CrashStream", (slf,))
     }
 
     fn _abort_auth_task(&self) {
@@ -1849,9 +2021,10 @@ impl PyBrowserContext {
         let auth = self.proxy_auth.clone();
         let opts = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bw = Some(Arc::downgrade(&b));
             b.new_tab_in_context(&cid, &url, proxy, auth, &opts)
                 .await
-                .map(|t| PyTab { inner: t })
+                .map(|t| PyTab { inner: t, browser: bw })
                 .map_err(rt)
         })
     }
@@ -1863,16 +2036,17 @@ impl PyBrowserContext {
         let auth = self.proxy_auth.clone();
         let opts = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bw = Some(Arc::downgrade(&b));
             let tabs = b
                 .list_tabs_in_context(&cid, proxy.clone(), auth.clone(), &opts)
                 .await
                 .map_err(rt)?;
             match tabs.into_iter().next() {
-                Some(t) => Ok(PyTab { inner: t }),
+                Some(t) => Ok(PyTab { inner: t, browser: bw }),
                 None => b
                     .new_tab_in_context(&cid, "about:blank", proxy, auth, &opts)
                     .await
-                    .map(|t| PyTab { inner: t })
+                    .map(|t| PyTab { inner: t, browser: bw })
                     .map_err(rt),
             }
         })
@@ -1885,9 +2059,14 @@ impl PyBrowserContext {
         let auth = self.proxy_auth.clone();
         let opts = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bw = Arc::downgrade(&b);
             b.list_tabs_in_context(&cid, proxy, auth, &opts)
                 .await
-                .map(|v| v.into_iter().map(|t| PyTab { inner: t }).collect::<Vec<_>>())
+                .map(|v| {
+                    v.into_iter()
+                        .map(|t| PyTab { inner: t, browser: Some(bw.clone()) })
+                        .collect::<Vec<_>>()
+                })
                 .map_err(rt)
         })
     }
@@ -1906,6 +2085,7 @@ impl PyBrowserContext {
         let auth = self.proxy_auth.clone();
         let opts = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let bw = Some(Arc::downgrade(&b));
             let tab = if new_tab {
                 b.new_tab_in_context(&cid, "about:blank", proxy, auth, &opts)
                     .await
@@ -1924,7 +2104,7 @@ impl PyBrowserContext {
                 }
             };
             tab.get(&url, None, &wait_until).await.map_err(rt)?;
-            Ok(PyTab { inner: tab })
+            Ok(PyTab { inner: tab, browser: bw })
         })
     }
 
@@ -1997,19 +2177,29 @@ impl PyBrowser {
     }
 
     fn main_tab<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |c| c.main_tab().await.map(|t| PyTab { inner: t }))
+        fut!(py, self.inner, |c| {
+            let bw = Some(Arc::downgrade(&c));
+            c.main_tab().await.map(|t| PyTab { inner: t, browser: bw })
+        })
     }
 
     #[pyo3(signature = (url="about:blank".to_string()))]
     fn new_tab<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |c| c.new_tab(&url).await.map(|t| PyTab { inner: t }))
+        fut!(py, self.inner, |c| {
+            let bw = Some(Arc::downgrade(&c));
+            c.new_tab(&url).await.map(|t| PyTab { inner: t, browser: bw })
+        })
     }
 
     fn tabs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |c| c
-            .list_tabs()
-            .await
-            .map(|v| v.into_iter().map(|t| PyTab { inner: t }).collect::<Vec<_>>()))
+        fut!(py, self.inner, |c| {
+            let bw = Arc::downgrade(&c);
+            c.list_tabs().await.map(|v| {
+                v.into_iter()
+                    .map(|t| PyTab { inner: t, browser: Some(bw.clone()) })
+                    .collect::<Vec<_>>()
+            })
+        })
     }
 
     #[pyo3(signature = (url, new_tab=false, wait_until="load".to_string()))]
@@ -2021,13 +2211,14 @@ impl PyBrowser {
         wait_until: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         fut!(py, self.inner, |c| async {
+            let bw = Some(Arc::downgrade(&c));
             let tab = if new_tab {
                 c.new_tab("about:blank").await?
             } else {
                 c.main_tab().await?
             };
             tab.get(&url, None, &wait_until).await?;
-            Ok::<PyTab, DriverError>(PyTab { inner: tab })
+            Ok::<PyTab, DriverError>(PyTab { inner: tab, browser: bw })
         }
         .await)
     }
@@ -2101,6 +2292,10 @@ impl PyBrowser {
                 .create_context(proxy, proxy_bypass_list)
                 .await
                 .map_err(rt)?;
+            b.context_configs.lock().await.insert(
+                cid.clone(),
+                (raw_proxy.clone(), auth.clone(), opts.clone()),
+            );
             Ok(PyBrowserContext {
                 browser: b,
                 context_id: cid,

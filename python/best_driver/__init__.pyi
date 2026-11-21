@@ -365,6 +365,10 @@ class Tab:
         """Close this tab via `Target.closeTarget`."""
         ...
 
+    async def is_alive(self) -> bool:
+        """Return `True` if this tab's target exists and its renderer process has not crashed."""
+        ...
+
     # Reading & evaluation
     async def evaluate(self, expression: str) -> Any:
         """Evaluate a JS expression (awaits Promises) and return its JSON-deserialized value."""
@@ -892,6 +896,30 @@ class Tab:
         """Open a live async stream of outgoing HTTP requests matching `url_pattern`."""
         ...
 
+    def expect_popup(self, timeout_ms: int = 30000) -> PopupExpectation:
+        """Await the next popup `Tab` opened by this tab (`window.open` / `target=_blank`).
+
+        Supports both Playwright-style `async with tab.expect_popup() as p: ...; tab2 = await p.value`
+        and direct `tab2 = await tab.expect_popup()`.
+        """
+        ...
+
+    def listen_popups(self) -> PopupStream:
+        """Open a live async stream of popup `Tab`s opened by this tab (stealth-safe, no `Runtime.enable`)."""
+        ...
+
+    def listen_console(self, types: Optional[Sequence[str]] = None) -> ConsoleStream:
+        """Open an opt-in async stream of JS `console.*` messages (`Runtime.enable` while active, `Runtime.disable` on exit)."""
+        ...
+
+    def listen_page_errors(self) -> PageErrorStream:
+        """Open an opt-in async stream of uncaught JS exceptions & unhandled rejections (`Runtime.disable` on exit)."""
+        ...
+
+    def listen_crashes(self) -> CrashStream:
+        """Open a stealth-safe async stream of renderer crash events (`Inspector.targetCrashed`)."""
+        ...
+
     def locator(self, query: str) -> Locator:
         """Create a lazy, auto-retrying Smart Locator chain resilient to SPA DOM re-renders."""
         ...
@@ -1049,6 +1077,96 @@ class ResponseStream(AsyncIterator[StreamedResponse]):
     async def __anext__(self) -> StreamedResponse: ...
     async def __aenter__(self) -> ResponseStream: ...
     async def __aexit__(self, *args: Any) -> bool: ...
+
+
+class ConsoleMessage:
+    """JavaScript `console.*` event yielded by `tab.listen_console()`."""
+
+    type: str
+    args: list[dict[str, Any]]
+    text: str
+    timestamp: float
+    url: str
+    line: int
+    column: int
+
+
+class PageError:
+    """Uncaught JavaScript exception or unhandled Promise rejection yielded by `tab.listen_page_errors()`."""
+
+    name: str
+    message: str
+    stack: str
+    url: str
+    line: int
+    column: int
+    timestamp: float
+
+
+class CrashEvent:
+    """Renderer crash event (`Inspector.targetCrashed`) yielded by `tab.listen_crashes()`."""
+
+    target_id: str
+    session_id: str
+    timestamp: float
+
+
+class ConsoleStream(AsyncIterator[ConsoleMessage]):
+    """Opt-in async stream of JS console messages (`Runtime.enable` while active, `Runtime.disable` on exit)."""
+
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[ConsoleMessage]: ...
+    def close(self) -> None: ...
+    async def aclose(self) -> None: ...
+    def __aiter__(self) -> ConsoleStream: ...
+    async def __anext__(self) -> ConsoleMessage: ...
+    async def __aenter__(self) -> ConsoleStream: ...
+    async def __aexit__(self, *args: Any) -> bool: ...
+
+
+class PageErrorStream(AsyncIterator[PageError]):
+    """Opt-in async stream of uncaught JS page errors (`Runtime.enable` while active, `Runtime.disable` on exit)."""
+
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[PageError]: ...
+    def close(self) -> None: ...
+    async def aclose(self) -> None: ...
+    def __aiter__(self) -> PageErrorStream: ...
+    async def __anext__(self) -> PageError: ...
+    async def __aenter__(self) -> PageErrorStream: ...
+    async def __aexit__(self, *args: Any) -> bool: ...
+
+
+class CrashStream(AsyncIterator[CrashEvent]):
+    """Stealth-safe async stream of renderer crash events (`Inspector.targetCrashed`)."""
+
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[CrashEvent]: ...
+    def close(self) -> None: ...
+    def __aiter__(self) -> CrashStream: ...
+    async def __anext__(self) -> CrashEvent: ...
+    async def __aenter__(self) -> CrashStream: ...
+    async def __aexit__(self, *args: Any) -> bool: ...
+
+
+class PopupStream(AsyncIterator[Tab]):
+    """Stealth-safe async stream of popup `Tab`s opened by a parent `Tab`."""
+
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[Tab]: ...
+    def close(self) -> None: ...
+    def __aiter__(self) -> PopupStream: ...
+    async def __anext__(self) -> Tab: ...
+    async def __aenter__(self) -> PopupStream: ...
+    async def __aexit__(self, *args: Any) -> bool: ...
+
+
+class PopupExpectation:
+    """Playwright-style popup waiter supporting `async with tab.expect_popup() as p:` and `await tab.expect_popup()`."""
+
+    popup: Optional[Tab]
+
+    @property
+    def value(self) -> Awaitable[Tab]: ...
+    async def __aenter__(self) -> PopupExpectation: ...
+    async def __aexit__(self, *args: Any) -> bool: ...
+    def __await__(self) -> Any: ...
 
 
 class Locator:
@@ -1286,7 +1404,11 @@ __all__ = [
     "Browser",
     "BrowserContext",
     "BrowserFingerprint",
+    "ConsoleMessage",
+    "ConsoleStream",
     "Cookie",
+    "CrashEvent",
+    "CrashStream",
     "DownloadInfo",
     "Element",
     "ElementDict",
@@ -1300,6 +1422,10 @@ __all__ = [
     "LocatorState",
     "MouseButton",
     "NetworkResponse",
+    "PageError",
+    "PageErrorStream",
+    "PopupExpectation",
+    "PopupStream",
     "RequestStream",
     "ResponseStream",
     "Route",

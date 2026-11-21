@@ -2,6 +2,13 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.3.2] - 2026-11-21
+
+### Added
+- **Race-Free Popup Capture (`tab.expect_popup()`, `tab.listen_popups()`)**: Captures `window.open()` and `<a target="_blank">` popups via browser-level `Target.targetCreated` filtering on `openerId` with zero `Runtime.enable` overhead. Supports both Playwright-style `async with tab.expect_popup() as p: ...; popup = await p.value` and direct `await tab.expect_popup()`, automatically inheriting owning `BrowserContext` proxy/emulation/init-scripts and pre-armed stealth evasion.
+- **Opt-In Stealth-Preserving `tab.listen_console()` & `tab.listen_page_errors()`**: Reference-counted `Runtime.enable` / `Runtime.disable` streams yielding structured `ConsoleMessage` (`type`, `text`, `args`, `url`, `line`, `column`, `timestamp`) and `PageError` (`name`, `message`, `stack`, `url`, `line`, `column`, `timestamp`). Default tabs never enable `Runtime`, and closing the stream automatically calls `Runtime.disable` to restore stealth.
+- **Renderer Crash Detection & Tab Health (`tab.listen_crashes()`, `tab.is_alive()`)**: Stealth-safe `Inspector.targetCrashed` stream and fast target/crash health probe so production 24/7 bots detect and replace a crashed renderer tab cleanly without affecting sibling tabs or contexts.
+
 ## [0.3.1] - 2026-11-21
 
 ### Fixed

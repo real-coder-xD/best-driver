@@ -239,7 +239,77 @@ async def main() -> None:
             print("  [LOCATOR] CSS+@attr, CSS+text:, CSS+XPath, eles union, child, closed shadow, literal text comma all matched")
             print("[PASS] SUITE 5: Zero-leak cleanup & mixed comma Smart Locators verified!")
 
-        print("\n>>> ALL V0.3.1 AUDIT TESTS PASSED (100%) <<<")
+            # ── SUITE 6: v0.3.2 Popups, Opt-in Console/PageErrors, Crash Detection ──
+            print("\n--- SUITE 6: expect_popup(), listen_popups(), listen_console/page_errors(), listen_crashes(), is_alive() ---")
+            # 6A: Playwright-style race-free expect_popup() inside isolated BrowserContext
+            async with await browser.new_context(timezone="Asia/Seoul") as pop_ctx:
+                await pop_ctx.add_init_script("window.__popCtxTag = 'seoul_pop';")
+                parent = await pop_ctx.get(form_url, wait_until="load")
+                assert await parent.is_alive() is True
+                async with parent.expect_popup(timeout_ms=10000) as pop_info:
+                    await parent.evaluate("void window.open('about:blank', '_blank')")
+                popup = await pop_info.value
+                assert popup.context_id == pop_ctx.context_id
+                await popup.get(form_url, wait_until="load")
+                pop_meta = await popup.evaluate("""({
+                    tag: window.__popCtxTag,
+                    tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                    wd: navigator.webdriver,
+                    stackTrap: (() => { let hit = false; const e = new Error(); Object.defineProperty(e, 'stack', { get() { hit = true; return ''; } }); console.debug(e); return hit; })()
+                })""")
+                print(f"  [POPUP CTX] {pop_meta}")
+                assert pop_meta["tag"] == "seoul_pop"
+                assert pop_meta["tz"] == "Asia/Seoul"
+                assert pop_meta["wd"] is False
+                assert pop_meta["stackTrap"] is False
+                await popup.close()
+                assert await popup.is_alive() is False
+
+                # 6B: Continuous listen_popups() stream
+                async with parent.listen_popups() as popups:
+                    await parent.evaluate("void window.open('about:blank', '_blank')")
+                    pop2 = await popups.next(timeout_ms=5000)
+                    assert pop2 is not None and await pop2.is_alive() is True
+                    await pop2.close()
+
+            # 6C: Opt-in listen_console() + listen_page_errors() + stealth restoration on exit
+            async with tab.listen_console() as logs, tab.listen_page_errors() as errs:
+                await tab.evaluate("console.warn('v032_warn', 42)")
+                await tab.evaluate("setTimeout(() => { throw new TypeError('v032_boom'); }, 10)")
+                cmsg = await logs.next(timeout_ms=3000)
+                perr = await errs.next(timeout_ms=3000)
+                print(f"  [CONSOLE] {cmsg} | [PAGE_ERROR] {perr}")
+                assert cmsg is not None and cmsg.type == "warning" and "v032_warn 42" in cmsg.text
+                assert perr is not None and "v032_boom" in perr.message
+
+            # After exiting both opt-in streams, Runtime.disable has been called -> verify trap is False again!
+            trap_after = await tab.evaluate("""(() => {
+                let hit = false;
+                const e = new Error();
+                Object.defineProperty(e, 'stack', { get() { hit = true; return ''; } });
+                console.debug(e);
+                return hit;
+            })()""")
+            print(f"  [STEALTH RESTORED] errorStackTrap_after_listen_console={trap_after}")
+            assert trap_after is False
+
+            # 6D: Renderer crash detection (Inspector.targetCrashed + tab.is_alive() == False)
+            t_crash = await browser.new_tab("about:blank")
+            assert await t_crash.is_alive() is True
+            async with t_crash.listen_crashes() as crashes:
+                try:
+                    await t_crash.send("Page.crash", {})
+                except Exception:
+                    pass
+                cev = await crashes.next(timeout_ms=5000)
+                print(f"  [CRASH DETECTED] {cev} | crashed_tab_alive={await t_crash.is_alive()} | main_tab_alive={await tab.is_alive()}")
+                assert cev is not None and cev.target_id == t_crash.target_id
+                assert await t_crash.is_alive() is False
+                assert await tab.is_alive() is True
+            await t_crash.close()
+            print("[PASS] SUITE 6: Popups, opt-in console/page_errors (+ stealth restore), and crash detection verified!")
+
+        print("\n>>> ALL V0.3.2 AUDIT TESTS PASSED (100%) <<<")
     finally:
         for p in (html_path, har_path):
             if os.path.exists(p):

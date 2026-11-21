@@ -635,7 +635,7 @@ class HarRecorder:
         return {
             "log": {
                 "version": "1.2",
-                "creator": {"name": "best-driver", "version": "0.3.1"},
+                "creator": {"name": "best-driver", "version": "0.3.2"},
                 "entries": list(self.entries),
             }
         }
@@ -659,7 +659,7 @@ def _cancel_task_safe(task: Optional[asyncio.Task[Any]]) -> None:
 
 
 def _evict_session(session_id: str) -> None:
-    """Synchronously detach route/HAR controllers for a closed tab session (thread-safe)."""
+    """Synchronously detach route/HAR/event controllers for a closed tab session (thread-safe)."""
     ctrl = _CONTROLLERS.pop(session_id, None)
     if ctrl is not None:
         if ctrl._stream is not None:
@@ -672,6 +672,12 @@ def _evict_session(session_id: str) -> None:
         rec._stream.close()
         _cancel_task_safe(rec._task)
         rec._task = None
+    try:
+        from .events import _evict_runtime_ref
+
+        _evict_runtime_ref(session_id)
+    except Exception:
+        pass
 
 
 def _evict_context(context_id: str) -> None:
@@ -714,7 +720,7 @@ async def export_har(tab: Any, path: Optional[str] = None) -> Dict[str, Any]:
     har = (
         rec.to_har()
         if rec is not None
-        else {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.1"}, "entries": []}}
+        else {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.2"}, "entries": []}}
     )
     if path is not None:
         with open(path, "w", encoding="utf-8") as fh:
@@ -726,7 +732,7 @@ async def stop_har(tab: Any) -> Dict[str, Any]:
     """Stop HAR 1.2 recording on `tab` and return the captured HAR dictionary."""
     rec = _HAR_RECORDERS.pop(tab.session_id, None)
     if rec is None:
-        return {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.1"}, "entries": []}}
+        return {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.2"}, "entries": []}}
     await rec.stop()
     return rec.to_har()
 

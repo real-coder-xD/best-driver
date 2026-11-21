@@ -159,6 +159,15 @@ impl CdpConnection {
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
         self.event_tx.subscribe()
     }
+
+    /// Emits an internal lifecycle event on the shared broadcast bus (e.g. after auto-attach resume).
+    pub fn emit_internal(&self, method: &str, params: Value) {
+        let _ = self.event_tx.send(CdpEvent {
+            session_id: None,
+            method: method.to_string(),
+            params,
+        });
+    }
 }
 
 /// Lightweight per-target flattened session handle multiplexed over the single browser `CdpConnection`.
@@ -167,29 +176,59 @@ pub struct CdpSession {
     pub session_id: String,
 }
 
-/// Event stream filtered strictly to one flattened `sessionId`.
+enum SessionFilter {
+    Session(String),
+    Popups {
+        opener_target_id: String,
+        parent_session_id: String,
+    },
+}
+
+/// Event stream filtered strictly to one flattened `sessionId` or popups opened by a parent target.
 pub struct SessionEventRx {
     rx: broadcast::Receiver<CdpEvent>,
-    session_id: String,
+    filter: SessionFilter,
 }
 
 impl SessionEventRx {
     pub async fn recv(&mut self) -> Result<(String, Value), broadcast::error::RecvError> {
         loop {
             match self.rx.recv().await {
-                Ok(ev) => {
-                    if ev.session_id.as_deref() == Some(self.session_id.as_str()) {
-                        return Ok((ev.method, ev.params));
+                Ok(ev) => match &self.filter {
+                    SessionFilter::Session(sid) => {
+                        if ev.session_id.as_deref() == Some(sid.as_str()) {
+                            return Ok((ev.method, ev.params));
+                        }
+                        // Terminate session streams immediately when their CDP target detaches
+                        // (tab.close(), ctx.close(), or JS window.close()).
+                        if ev.method == "Target.detachedFromTarget"
+                            && ev.params.get("sessionId").and_then(|v| v.as_str())
+                                == Some(sid.as_str())
+                        {
+                            return Err(broadcast::error::RecvError::Closed);
+                        }
                     }
-                    // Terminate session streams immediately when their CDP target detaches
-                    // (tab.close(), ctx.close(), or JS window.close()).
-                    if ev.method == "Target.detachedFromTarget"
-                        && ev.params.get("sessionId").and_then(|v| v.as_str())
-                            == Some(self.session_id.as_str())
-                    {
-                        return Err(broadcast::error::RecvError::Closed);
+                    SessionFilter::Popups {
+                        opener_target_id,
+                        parent_session_id,
+                    } => {
+                        if ev.method == "Target.detachedFromTarget"
+                            && ev.params.get("sessionId").and_then(|v| v.as_str())
+                                == Some(parent_session_id.as_str())
+                        {
+                            return Err(broadcast::error::RecvError::Closed);
+                        }
+                        if ev.method == "_internal.popupReady" {
+                            let opener = ev
+                                .params
+                                .pointer("/targetInfo/openerId")
+                                .and_then(|v| v.as_str());
+                            if opener == Some(opener_target_id.as_str()) {
+                                return Ok((ev.method, ev.params));
+                            }
+                        }
                     }
-                }
+                },
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(e) => return Err(e),
             }
@@ -212,7 +251,18 @@ impl CdpSession {
     pub fn subscribe(&self) -> SessionEventRx {
         SessionEventRx {
             rx: self.conn.subscribe(),
-            session_id: self.session_id.clone(),
+            filter: SessionFilter::Session(self.session_id.clone()),
+        }
+    }
+
+    /// Subscribes to browser-level `Target.targetCreated` popup events opened by `opener_target_id`.
+    pub fn subscribe_popups(&self, opener_target_id: String) -> SessionEventRx {
+        SessionEventRx {
+            rx: self.conn.subscribe(),
+            filter: SessionFilter::Popups {
+                opener_target_id,
+                parent_session_id: self.session_id.clone(),
+            },
         }
     }
 
