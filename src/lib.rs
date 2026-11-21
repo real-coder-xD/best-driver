@@ -138,6 +138,44 @@ struct ProxyAuth {
     pass: String,
 }
 
+#[derive(Clone, Default)]
+struct ContextOptions {
+    user_agent: Option<String>,
+    accept_language: Option<String>,
+    platform: Option<String>,
+    viewport: Option<(i64, i64, f64, bool)>,
+    locale: Option<String>,
+    timezone: Option<String>,
+    extra_headers: Option<Value>,
+    init_scripts: Arc<Mutex<Vec<String>>>,
+}
+
+impl ContextOptions {
+    async fn apply_to_tab(&self, tab: &Tab) -> DriverResult<()> {
+        if let Some(ref ua) = self.user_agent {
+            tab.set_user_agent(ua, self.accept_language.as_deref(), self.platform.as_deref())
+                .await?;
+        }
+        if let Some((w, h, scale, mobile)) = self.viewport {
+            tab.set_viewport(w, h, scale, mobile).await?;
+        }
+        if let Some(ref loc) = self.locale {
+            tab.set_locale(loc).await?;
+        }
+        if let Some(ref tz) = self.timezone {
+            tab.set_timezone(tz).await?;
+        }
+        if let Some(ref hdrs) = self.extra_headers {
+            tab.set_extra_headers(hdrs.clone()).await?;
+        }
+        let scripts = self.init_scripts.lock().await.clone();
+        for src in scripts {
+            let _ = tab.add_init_script(&src).await;
+        }
+        Ok(())
+    }
+}
+
 /// `"scheme://user:pass@host:port"` -> `("scheme://host:port", Some(auth))`
 fn split_proxy(raw: &str) -> (String, Option<ProxyAuth>) {
     let (scheme, rest) = raw.split_once("://").unwrap_or(("http", raw));
@@ -232,6 +270,10 @@ impl BrowserCore {
         if let Some(p) = proxy {
             let (server, auth) = split_proxy(&p);
             args.push(format!("--proxy-server={}", server));
+            // Prevent local IP leakage over WebRTC STUN/UDP when routing through a proxy
+            if !args.iter().any(|a| a.starts_with("--force-webrtc-ip-handling-policy")) {
+                args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
+            }
             proxy_auth = auth;
         }
         let proc = BrowserProcess::launch(headless, user_data_dir, browser_path, Some(args)).await?;
@@ -356,14 +398,15 @@ impl BrowserCore {
     }
 
     async fn attach(&self, target_id: String) -> DriverResult<Arc<Tab>> {
-        self.attach_with_proxy(target_id, None, None).await
+        self.attach_with_context(target_id, None, None, None).await
     }
 
-    async fn attach_with_proxy(
+    async fn attach_with_context(
         &self,
         target_id: String,
         proxy_override: Option<String>,
         proxy_auth_override: Option<ProxyAuth>,
+        browser_context_id: Option<String>,
     ) -> DriverResult<Arc<Tab>> {
         // Reuse auto-attached flattened session if present; otherwise attach via Target.attachToTarget(flatten: true)
         let session_id = match self.sessions_by_target.lock().await.get(&target_id).cloned() {
@@ -403,7 +446,7 @@ impl BrowserCore {
         let effective_auth = proxy_auth_override.or_else(|| self.proxy_auth.clone());
 
         let session = self.conn.session(session_id);
-        let tab = Tab::new(target_id.clone(), session, effective_proxy).await?;
+        let tab = Tab::new(target_id.clone(), session, effective_proxy, browser_context_id).await?;
         if let Some(a) = effective_auth {
             tab.enable_proxy_auth(a.user, a.pass).await?;
         }
@@ -450,6 +493,7 @@ impl BrowserCore {
         url: &str,
         proxy: Option<String>,
         proxy_auth: Option<ProxyAuth>,
+        opts: &ContextOptions,
     ) -> DriverResult<Arc<Tab>> {
         if self.process.lock().await.is_none() {
             return Err(DriverError::BrowserClosed);
@@ -466,7 +510,10 @@ impl BrowserCore {
             .and_then(|v| v.as_str())
             .ok_or_else(|| DriverError::Connection("Target.createTarget không trả targetId".to_string()))?
             .to_string();
-        let tab = self.attach_with_proxy(target_id, proxy, proxy_auth).await?;
+        let tab = self
+            .attach_with_context(target_id, proxy, proxy_auth, Some(ctx_id.to_string()))
+            .await?;
+        opts.apply_to_tab(&tab).await?;
         if url != "about:blank" {
             tab.get(url, None, "load").await?;
         }
@@ -478,6 +525,7 @@ impl BrowserCore {
         ctx_id: &str,
         proxy: Option<String>,
         proxy_auth: Option<ProxyAuth>,
+        opts: &ContextOptions,
     ) -> DriverResult<Vec<Arc<Tab>>> {
         if self.process.lock().await.is_none() {
             return Err(DriverError::BrowserClosed);
@@ -503,10 +551,16 @@ impl BrowserCore {
             match cached {
                 Some(tab) => out.push(tab),
                 None => {
-                    out.push(
-                        self.attach_with_proxy(tid, proxy.clone(), proxy_auth.clone())
-                            .await?,
-                    );
+                    let tab = self
+                        .attach_with_context(
+                            tid,
+                            proxy.clone(),
+                            proxy_auth.clone(),
+                            Some(ctx_id.to_string()),
+                        )
+                        .await?;
+                    let _ = opts.apply_to_tab(&tab).await;
+                    out.push(tab);
                 }
             }
         }
@@ -752,6 +806,36 @@ impl PyElement {
         fut!(py, self.tab, |t| t.scroll_into_view_node(nid).await)
     }
 
+    fn is_visible<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let nid = self.backend_node_id;
+        fut!(py, self.tab, |t| t.is_visible_node(nid).await)
+    }
+
+    fn is_enabled<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let nid = self.backend_node_id;
+        fut!(py, self.tab, |t| t.is_enabled_node(nid).await)
+    }
+
+    fn is_checked<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let nid = self.backend_node_id;
+        fut!(py, self.tab, |t| t.is_checked_node(nid).await)
+    }
+
+    fn check<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let nid = self.backend_node_id;
+        fut!(py, self.tab, |t| t.check_node(nid, true).await)
+    }
+
+    fn uncheck<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let nid = self.backend_node_id;
+        fut!(py, self.tab, |t| t.check_node(nid, false).await)
+    }
+
+    fn select_option<'py>(&self, py: Python<'py>, value: String) -> PyResult<Bound<'py, PyAny>> {
+        let nid = self.backend_node_id;
+        fut!(py, self.tab, |t| t.select_option_node(nid, &value).await)
+    }
+
     #[pyo3(signature = (file_path=None))]
     fn screenshot<'py>(&self, py: Python<'py>, file_path: Option<String>) -> PyResult<Bound<'py, PyAny>> {
         let nid = self.backend_node_id;
@@ -824,6 +908,49 @@ impl PyTab {
     #[getter]
     fn proxy(&self) -> Option<String> {
         self.inner.proxy().map(str::to_string)
+    }
+
+    #[getter]
+    fn context_id(&self) -> Option<String> {
+        self.inner.context_id().map(str::to_string)
+    }
+
+    fn add_init_script<'py>(&self, py: Python<'py>, script: String) -> PyResult<Bound<'py, PyAny>> {
+        fut!(py, self.inner, |t| t.add_init_script(&script).await)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (url, method="GET".to_string(), headers=None, body=None, json=None, credentials="include".to_string()))]
+    fn fetch<'py>(
+        &self,
+        py: Python<'py>,
+        url: String,
+        method: String,
+        headers: Option<&Bound<'py, PyAny>>,
+        body: Option<String>,
+        json: Option<&Bound<'py, PyAny>>,
+        credentials: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut hdrs = match headers {
+            Some(h) => py_to_value(h)?,
+            None => Value::Object(serde_json::Map::new()),
+        };
+        let final_body = if let Some(j) = json {
+            let jv = py_to_value(j)?;
+            if let Some(map) = hdrs.as_object_mut() {
+                let has_ct = map.keys().any(|k| k.eq_ignore_ascii_case("content-type"));
+                if !has_ct {
+                    map.insert("Content-Type".into(), Value::String("application/json".into()));
+                }
+            }
+            Some(jv.to_string())
+        } else {
+            body
+        };
+        fut!(py, self.inner, |t| t
+            .fetch(&url, &method, Some(hdrs), final_body, &credentials)
+            .await
+            .map(PyJson))
     }
 
     // fingerprint & http_tls session sync
@@ -1490,14 +1617,16 @@ impl PyTab {
         self.inner.abort_auth_task();
     }
 
+    #[pyo3(signature = (url_pattern, handler, stage="request".to_string()))]
     fn route<'py>(
         slf: Py<Self>,
         py: Python<'py>,
         url_pattern: String,
         handler: Bound<'py, PyAny>,
+        stage: String,
     ) -> PyResult<Bound<'py, PyAny>> {
         let m = py.import("best_driver.network")?;
-        m.call_method1("add_route", (slf, url_pattern, handler))
+        m.call_method1("add_route", (slf, url_pattern, handler, stage))
     }
 
     #[pyo3(signature = (url_pattern=None))]
@@ -1508,6 +1637,31 @@ impl PyTab {
     ) -> PyResult<Bound<'py, PyAny>> {
         let m = py.import("best_driver.network")?;
         m.call_method1("remove_route", (slf, url_pattern))
+    }
+
+    #[pyo3(signature = (include_bodies=true))]
+    fn record_har<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        include_bodies: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.network")?;
+        m.call_method1("start_har", (slf, include_bodies))
+    }
+
+    #[pyo3(signature = (path=None))]
+    fn export_har<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        path: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.network")?;
+        m.call_method1("export_har", (slf, path))
+    }
+
+    fn stop_har<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.network")?;
+        m.call_method1("stop_har", (slf,))
     }
 
     #[pyo3(signature = (url_pattern=None))]
@@ -1601,6 +1755,7 @@ pub struct PyBrowserContext {
     context_id: String,
     proxy: Option<String>,
     proxy_auth: Option<ProxyAuth>,
+    options: ContextOptions,
 }
 
 #[pymethods]
@@ -1619,14 +1774,32 @@ impl PyBrowserContext {
         self.proxy.clone()
     }
 
+    fn add_init_script<'py>(&self, py: Python<'py>, script: String) -> PyResult<Bound<'py, PyAny>> {
+        let b = Arc::clone(&self.browser);
+        let cid = self.context_id.clone();
+        let proxy = self.proxy.clone();
+        let auth = self.proxy_auth.clone();
+        let opts = self.options.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            opts.init_scripts.lock().await.push(script.clone());
+            if let Ok(tabs) = b.list_tabs_in_context(&cid, proxy, auth, &opts).await {
+                for t in tabs {
+                    let _ = t.add_init_script(&script).await;
+                }
+            }
+            Ok::<(), PyErr>(())
+        })
+    }
+
     #[pyo3(signature = (url="about:blank".to_string()))]
     fn new_tab<'py>(&self, py: Python<'py>, url: String) -> PyResult<Bound<'py, PyAny>> {
         let b = Arc::clone(&self.browser);
         let cid = self.context_id.clone();
         let proxy = self.proxy.clone();
         let auth = self.proxy_auth.clone();
+        let opts = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            b.new_tab_in_context(&cid, &url, proxy, auth)
+            b.new_tab_in_context(&cid, &url, proxy, auth, &opts)
                 .await
                 .map(|t| PyTab { inner: t })
                 .map_err(rt)
@@ -1638,12 +1811,16 @@ impl PyBrowserContext {
         let cid = self.context_id.clone();
         let proxy = self.proxy.clone();
         let auth = self.proxy_auth.clone();
+        let opts = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let tabs = b.list_tabs_in_context(&cid, proxy.clone(), auth.clone()).await.map_err(rt)?;
+            let tabs = b
+                .list_tabs_in_context(&cid, proxy.clone(), auth.clone(), &opts)
+                .await
+                .map_err(rt)?;
             match tabs.into_iter().next() {
                 Some(t) => Ok(PyTab { inner: t }),
                 None => b
-                    .new_tab_in_context(&cid, "about:blank", proxy, auth)
+                    .new_tab_in_context(&cid, "about:blank", proxy, auth, &opts)
                     .await
                     .map(|t| PyTab { inner: t })
                     .map_err(rt),
@@ -1656,8 +1833,9 @@ impl PyBrowserContext {
         let cid = self.context_id.clone();
         let proxy = self.proxy.clone();
         let auth = self.proxy_auth.clone();
+        let opts = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            b.list_tabs_in_context(&cid, proxy, auth)
+            b.list_tabs_in_context(&cid, proxy, auth, &opts)
                 .await
                 .map(|v| v.into_iter().map(|t| PyTab { inner: t }).collect::<Vec<_>>())
                 .map_err(rt)
@@ -1676,14 +1854,23 @@ impl PyBrowserContext {
         let cid = self.context_id.clone();
         let proxy = self.proxy.clone();
         let auth = self.proxy_auth.clone();
+        let opts = self.options.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let tab = if new_tab {
-                b.new_tab_in_context(&cid, "about:blank", proxy, auth).await.map_err(rt)?
+                b.new_tab_in_context(&cid, "about:blank", proxy, auth, &opts)
+                    .await
+                    .map_err(rt)?
             } else {
-                let existing = b.list_tabs_in_context(&cid, proxy.clone(), auth.clone()).await.map_err(rt)?;
+                let existing = b
+                    .list_tabs_in_context(&cid, proxy.clone(), auth.clone(), &opts)
+                    .await
+                    .map_err(rt)?;
                 match existing.into_iter().next() {
                     Some(t) => t,
-                    None => b.new_tab_in_context(&cid, "about:blank", proxy, auth).await.map_err(rt)?,
+                    None => b
+                        .new_tab_in_context(&cid, "about:blank", proxy, auth, &opts)
+                        .await
+                        .map_err(rt)?,
                 }
             };
             tab.get(&url, None, &wait_until).await.map_err(rt)?;
@@ -1792,13 +1979,69 @@ impl PyBrowser {
         .await)
     }
 
-    #[pyo3(signature = (proxy=None, proxy_bypass_list=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        proxy=None,
+        proxy_bypass_list=None,
+        user_agent=None,
+        accept_language=None,
+        platform=None,
+        viewport=None,
+        locale=None,
+        timezone=None,
+        extra_headers=None
+    ))]
     fn new_context<'py>(
         &self,
         py: Python<'py>,
         proxy: Option<String>,
         proxy_bypass_list: Option<String>,
+        user_agent: Option<String>,
+        accept_language: Option<String>,
+        platform: Option<String>,
+        viewport: Option<&Bound<'py, PyDict>>,
+        locale: Option<String>,
+        timezone: Option<String>,
+        extra_headers: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let parsed_vp = match viewport {
+            Some(d) => {
+                let w: i64 = d
+                    .get_item("width")?
+                    .ok_or_else(|| rt(DriverError::InvalidInput("viewport thiếu 'width'".into())))?
+                    .extract()?;
+                let h: i64 = d
+                    .get_item("height")?
+                    .ok_or_else(|| rt(DriverError::InvalidInput("viewport thiếu 'height'".into())))?
+                    .extract()?;
+                let scale: f64 = d
+                    .get_item("scale")?
+                    .map(|v| v.extract())
+                    .transpose()?
+                    .unwrap_or(1.0);
+                let mobile: bool = d
+                    .get_item("mobile")?
+                    .map(|v| v.extract())
+                    .transpose()?
+                    .unwrap_or(false);
+                Some((w, h, scale, mobile))
+            }
+            None => None,
+        };
+        let parsed_headers = match extra_headers {
+            Some(h) => Some(py_to_value(h)?),
+            None => None,
+        };
+        let opts = ContextOptions {
+            user_agent,
+            accept_language,
+            platform,
+            viewport: parsed_vp,
+            locale,
+            timezone,
+            extra_headers: parsed_headers,
+            init_scripts: Arc::new(Mutex::new(Vec::new())),
+        };
         let b = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let (cid, raw_proxy, auth) = b
@@ -1810,6 +2053,7 @@ impl PyBrowser {
                 context_id: cid,
                 proxy: raw_proxy,
                 proxy_auth: auth,
+                options: opts,
             })
         })
     }

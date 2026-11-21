@@ -22,17 +22,16 @@ SPA_HTML = """<!DOCTYPE html>
     window.__spaClicks = 0;
     window.__closedClicked = false;
 
-    // Simulate aggressive React/Next.js re-renders replacing DOM nodes every 120ms
+    // Simulate React/Next.js re-renders replacing DOM nodes (forces stale backendNodeId)
     let gen = 0;
-    function renderSpa() {
+    window.renderSpa = function renderSpa() {
       gen++;
       const root = document.getElementById('spa-root');
       root.innerHTML =
         '<div class="card"><span>Card 0</span><button class="act">Btn 0</button></div>' +
         '<div class="card"><span>Card 1 (gen ' + gen + ')</span><button class="act" onclick="window.__spaClicks++; document.getElementById(\\'log\\').innerText=\\'clicked:\\'+window.__spaClicks">Target Action</button></div>';
-    }
-    renderSpa();
-    setInterval(renderSpa, 120);
+    };
+    window.renderSpa();
 
     // Closed shadow root host
     const ch = document.getElementById('closed-host');
@@ -84,8 +83,45 @@ async def main() -> None:
                 assert cb == {"owner": "context_B"}, f"Context B leaked: {cb}"
                 assert la == "A" and lb == "B"
                 assert len(await ctx_a.tabs()) == 1 and len(await ctx_b.tabs()) == 1
+
+                # Regression test: tab.cookies(), tab.storage_state(), and tab.tls_session() INSIDE BrowserContext!
+                await tab_a.set_cookies([
+                    {
+                        "name": "ctx_a_httponly",
+                        "value": "secret_alpha_99",
+                        "domain": "httpbin.org",
+                        "path": "/",
+                        "secure": True,
+                        "httpOnly": True,
+                    }
+                ])
+                raw_ca = await tab_a.cookies()
+                raw_cb = await tab_b.cookies()
+                names_a = {c["name"]: c["value"] for c in raw_ca}
+                names_b = {c["name"]: c["value"] for c in raw_cb}
+                print(f"  [CTX A tab.cookies()] {names_a}")
+                print(f"  [CTX B tab.cookies()] {names_b}")
+                assert names_a.get("owner") == "context_A"
+                assert names_a.get("ctx_a_httponly") == "secret_alpha_99"
+                assert "ctx_a_httponly" not in names_b and names_b.get("owner") == "context_B"
+
+                # Verify tab_a.tls_session() inside BrowserContext carries Context A's cookies (incl. HttpOnly)!
+                async with await tab_a.tls_session() as tls_a:
+                    echo_a = (await tls_a.get("https://httpbin.org/cookies")).json()["cookies"]
+                    print(f"  [CTX A -> http_tls] {echo_a}")
+                    assert echo_a.get("owner") == "context_A"
+                    assert echo_a.get("ctx_a_httponly") == "secret_alpha_99"
+                async with await tab_b.tls_session() as tls_b:
+                    echo_b = (await tls_b.get("https://httpbin.org/cookies")).json()["cookies"]
+                    print(f"  [CTX B -> http_tls] {echo_b}")
+                    assert echo_b == {"owner": "context_B"}
+
+                # Verify clear_cookies() inside Context A does NOT wipe Context B!
+                await tab_a.clear_cookies()
+                assert await tab_a.cookies() == []
+                assert any(c["name"] == "owner" and c["value"] == "context_B" for c in await tab_b.cookies())
             assert await browser.is_alive() is True
-            print("[PASS] SUITE 1: 2 isolated BrowserContexts verified in 1 Chromium process!")
+            print("[PASS] SUITE 1: 2 isolated BrowserContexts + tab.cookies() + tls_session() + clear_cookies() verified!")
 
             # ── SUITE 2: tab.route() Mock JSON, Header Inject, Abort ──────────
             print("\n--- SUITE 2: tab.route() Intercept / Mock / Modify / Abort ---")
@@ -157,9 +193,11 @@ async def main() -> None:
             target_btn = tab.locator("#spa-root").locator(".card").nth(1).locator("button.act")
             assert await tab.locator("#spa-root").locator(".card").count() == 2
             await target_btn.click()
+            # Force full SPA DOM replacement — any snapshot Element handle is now detached/stale
+            await tab.evaluate("window.renderSpa()")
             await target_btn.click()
             clicks = await tab.evaluate("window.__spaClicks")
-            print(f"  [LOCATOR SPA] 2 clicks across 120ms re-render loop -> clicks={clicks}")
+            print(f"  [LOCATOR SPA] 2 clicks across full DOM replacement -> clicks={clicks}")
             assert clicks == 2
 
             closed_loc = tab.locator("#closed-host").locator("#closed-btn")

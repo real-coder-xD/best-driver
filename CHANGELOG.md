@@ -2,6 +2,19 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.3.0] - 2026-11-21
+
+### Fixed
+- **`BrowserContext` Cookie Scoping (`Storage.getCookies` / `setCookies` / `clearCookies`)**: `Tab` now retains its owning `browser_context_id` and passes `browserContextId` to CDP `Storage.*` cookie commands, fixing the `0`-cookie bug when calling `tab.cookies()`, `tab.storage_state()`, `tab.tls_session()`, or `tab.clear_cookies()` inside an isolated `BrowserContext`.
+
+### Added
+- **Response-Stage Interception (`tab.route(..., stage="response")`) & `route.fetch()`**: Intercept and modify live server responses (`route.response_body()`, `response_text()`, `response_json()`, `continue_response()`, `fulfill()`) before page JavaScript receives them.
+- **Native In-Browser `tab.fetch()`**: Executes `fetch()` directly through Chromium's real TLS stack, HTTP/2, and cookie jar (supporting `method`, `headers`, `body`, `json`, `credentials`) for ultra-strict JA4-pinned endpoints.
+- **HAR 1.2 Recording (`tab.record_har()`, `tab.export_har()`, `tab.stop_har()`)**: Captures full HAR 1.2 network traces with optional response bodies directly from `Tab`.
+- **Per-Context Emulation & Init Scripts**: Extended `browser.new_context()` with `user_agent`, `accept_language`, `platform`, `viewport`, `locale`, `timezone`, and `extra_headers`, plus `tab.add_init_script()` and `ctx.add_init_script()` (`Page.addScriptToEvaluateOnNewDocument`) and `tab.context_id`.
+- **Playwright-Grade `Locator` & `Element` Forms**: Added `loc.filter(has_text=..., has_not_text=...)`, `loc.wait_for(state="visible"|"attached"|"hidden"|"detached")`, and Shadow-DOM-safe `is_visible()`, `is_enabled()`, `is_checked()`, `check()`, `uncheck()`, `select_option()`, and `press_key()`.
+- **Stealth & Dev Polish**: Auto-applies `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` when a proxy is configured to prevent WebRTC UDP IP leaks; cleared `worldName` (`""`) in `Page.createIsolatedWorld`; added `[profile.dev] debug = 0` to keep local build caches compact.
+
 ## [0.2.0] - 2026-11-21
 
 ### Network Control, Isolated Concurrency & Auto-Retrying Locators

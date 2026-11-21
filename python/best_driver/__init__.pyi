@@ -19,6 +19,28 @@ else:
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "none", "commit"]
 MouseButton = Literal["left", "right", "middle"]
 ImageFormat = Literal["png", "jpeg", "jpg", "webp"]
+RouteStage = Literal["request", "response"]
+LocatorState = Literal["attached", "visible", "hidden", "detached"]
+
+
+class ViewportSize(TypedDict, total=False):
+    """Viewport configuration passed to `browser.new_context(viewport=...)`."""
+
+    width: int
+    height: int
+    scale: float
+    mobile: bool
+
+
+class FetchResponse(TypedDict):
+    """Response dictionary returned by `Tab.fetch()` (executed inside Chromium's native TLS stack)."""
+
+    url: str
+    status: int
+    status_text: str
+    ok: bool
+    headers: dict[str, str]
+    body: str
 SpecialKey = Literal[
     "Enter",
     "Return",
@@ -227,6 +249,30 @@ class Element:
 
     async def scroll_into_view(self) -> None:
         """Center this element in the viewport."""
+        ...
+
+    async def is_visible(self) -> bool:
+        """Return `True` if this element has visible computed style and non-zero layout box."""
+        ...
+
+    async def is_enabled(self) -> bool:
+        """Return `True` if this element is not disabled."""
+        ...
+
+    async def is_checked(self) -> bool:
+        """Return `True` if this checkbox/radio is checked."""
+        ...
+
+    async def check(self) -> None:
+        """Ensure this checkbox/radio is checked."""
+        ...
+
+    async def uncheck(self) -> None:
+        """Ensure this checkbox is unchecked."""
+        ...
+
+    async def select_option(self, value: str) -> None:
+        """Select a `<select>` option by `value` or visible label."""
         ...
 
     async def screenshot(self, file_path: Optional[str] = None) -> bytes:
@@ -758,7 +804,28 @@ class Tab:
 
     @property
     def proxy(self) -> Optional[str]:
-        """Proxy URL inherited from the parent `Browser`, or `None`."""
+        """Proxy URL inherited from the parent `Browser` or `BrowserContext`, or `None`."""
+        ...
+
+    @property
+    def context_id(self) -> Optional[str]:
+        """Owning `BrowserContext` identifier, or `None` for the default context."""
+        ...
+
+    async def add_init_script(self, script: str) -> str:
+        """Inject JavaScript via `Page.addScriptToEvaluateOnNewDocument` before any page script runs."""
+        ...
+
+    async def fetch(
+        self,
+        url: str,
+        method: str = "GET",
+        headers: Optional[dict[str, str]] = None,
+        body: Optional[str] = None,
+        json: Any = None,
+        credentials: str = "include",
+    ) -> FetchResponse:
+        """Execute a real in-browser `fetch()` over Chromium's native TLS stack and cookie jar."""
         ...
 
     async def fingerprint(self) -> BrowserFingerprint:
@@ -792,12 +859,29 @@ class Tab:
         """Push updated cookies from an `http_tls` session back into this Chromium tab; returns count synced."""
         ...
 
-    async def route(self, url_pattern: str, handler: RouteHandler) -> None:
-        """Intercept requests matching `url_pattern` (glob or substring) via CDP Fetch; handler receives `Route`."""
+    async def route(
+        self,
+        url_pattern: str,
+        handler: RouteHandler,
+        stage: RouteStage = "request",
+    ) -> None:
+        """Intercept requests or responses (`stage='request'|'response'`) matching `url_pattern` via CDP Fetch."""
         ...
 
     async def unroute(self, url_pattern: Optional[str] = None) -> None:
         """Remove registered route(s) for `url_pattern` (or all routes when `None`)."""
+        ...
+
+    async def record_har(self, include_bodies: bool = True) -> HarRecorder:
+        """Start recording HAR 1.2 network transactions on this tab."""
+        ...
+
+    async def export_har(self, path: Optional[str] = None) -> dict[str, Any]:
+        """Return recorded HAR 1.2 data (optionally writing pretty JSON to `path`)."""
+        ...
+
+    async def stop_har(self) -> dict[str, Any]:
+        """Stop HAR 1.2 recording on this tab and return the captured HAR dictionary."""
         ...
 
     def listen_responses(self, url_pattern: Optional[str] = None) -> ResponseStream:
@@ -821,7 +905,7 @@ class EventStream:
 
 
 class Route:
-    """Intercepted CDP Fetch request passed to a `tab.route()` handler."""
+    """Intercepted CDP Fetch request or response passed to a `tab.route()` handler."""
 
     request_id: str
     url: str
@@ -829,7 +913,33 @@ class Route:
     headers: dict[str, str]
     post_data: Optional[str]
     resource_type: str
+    response_status: Optional[int]
+    response_headers: dict[str, str]
+    stage: RouteStage
     handled: bool
+
+    async def response_body(self) -> bytes:
+        """Read the real server response body bytes (`stage == 'response'`)."""
+        ...
+
+    async def response_text(self, encoding: str = "utf-8") -> str:
+        """Decode the intercepted server response body as text."""
+        ...
+
+    async def response_json(self) -> Any:
+        """Parse the intercepted server response body as JSON."""
+        ...
+
+    async def fetch(
+        self,
+        *,
+        url: Optional[str] = None,
+        method: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
+        body: Optional[str] = None,
+    ) -> FetchResponse:
+        """Perform the real upstream HTTP request via `http_tls` (if installed) or `tab.fetch()`."""
+        ...
 
     async def continue_(
         self,
@@ -839,7 +949,16 @@ class Route:
         headers: Optional[dict[str, str]] = None,
         post_data: Optional[Union[str, bytes]] = None,
     ) -> None:
-        """Continue the intercepted request with optional URL, method, header, or body overrides."""
+        """Continue the intercepted request (or response) with optional overrides."""
+        ...
+
+    async def continue_response(
+        self,
+        *,
+        status: Optional[int] = None,
+        headers: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Continue an intercepted response (`stage == 'response'`) with optional status/header edits."""
         ...
 
     async def fulfill(
@@ -851,12 +970,22 @@ class Route:
         content_type: Optional[str] = None,
         json: Any = None,
     ) -> None:
-        """Fulfill the request directly with a synthetic HTTP response (mocking)."""
+        """Fulfill the intercepted request or replace the intercepted server response."""
         ...
 
     async def abort(self, error_reason: str = "Failed") -> None:
         """Abort the intercepted request with a Chromium network error reason."""
         ...
+
+
+class HarRecorder:
+    """Background HAR 1.2 network recorder attached to a `Tab`."""
+
+    entries: list[dict[str, Any]]
+
+    def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    def to_har(self) -> dict[str, Any]: ...
 
 
 RouteHandler = Callable[[Route], Union[None, Awaitable[None]]]
@@ -929,6 +1058,15 @@ class Locator:
         """Chain a descendant Smart Locator query (CSS, XPath, `text:`, `@attr`, open/closed Shadow DOM)."""
         ...
 
+    def filter(
+        self,
+        *,
+        has_text: Optional[str] = None,
+        has_not_text: Optional[str] = None,
+    ) -> Locator:
+        """Filter matched elements at the current step by substring inclusion/exclusion."""
+        ...
+
     @property
     def first(self) -> Locator:
         """Select the first match (`nth(0)`)."""
@@ -947,7 +1085,10 @@ class Locator:
     async def all(self, timeout_ms: int = 10000) -> list[Element]: ...
     async def count(self) -> int: ...
     async def exists(self) -> bool: ...
-    async def wait_for(self, timeout_ms: int = 10000) -> None: ...
+    async def is_visible(self) -> bool: ...
+    async def is_enabled(self) -> bool: ...
+    async def is_checked(self) -> bool: ...
+    async def wait_for(self, timeout_ms: int = 10000, state: LocatorState = "visible") -> None: ...
     async def wait_for_hidden(self, timeout_ms: int = 10000) -> None: ...
     async def click(
         self,
@@ -961,6 +1102,10 @@ class Locator:
     async def human_type(self, text: str, clear: bool = False, timeout_ms: int = 10000) -> None: ...
     async def fill(self, text: str, timeout_ms: int = 10000) -> None: ...
     async def clear(self, timeout_ms: int = 10000) -> None: ...
+    async def check(self, timeout_ms: int = 10000) -> None: ...
+    async def uncheck(self, timeout_ms: int = 10000) -> None: ...
+    async def select_option(self, value: str, timeout_ms: int = 10000) -> None: ...
+    async def press_key(self, key: Union[SpecialKey, str], timeout_ms: int = 10000) -> None: ...
     async def text(self, timeout_ms: int = 10000) -> str: ...
     async def attr(self, name: str, timeout_ms: int = 10000) -> Optional[str]: ...
     async def value(self, timeout_ms: int = 10000) -> Optional[str]: ...
@@ -981,6 +1126,10 @@ class BrowserContext:
     @property
     def proxy(self) -> Optional[str]:
         """Proxy URL bound specifically to this context, or `None`."""
+        ...
+
+    async def add_init_script(self, script: str) -> None:
+        """Inject JavaScript before any page script runs for all current and future tabs in this context."""
         ...
 
     async def main_tab(self) -> Tab:
@@ -1064,8 +1213,15 @@ class Browser:
         self,
         proxy: Optional[str] = None,
         proxy_bypass_list: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        accept_language: Optional[str] = None,
+        platform: Optional[str] = None,
+        viewport: Optional[ViewportSize] = None,
+        locale: Optional[str] = None,
+        timezone: Optional[str] = None,
+        extra_headers: Optional[dict[str, str]] = None,
     ) -> BrowserContext:
-        """Create an isolated incognito `BrowserContext` with separate cookies, storage, and optional per-context proxy."""
+        """Create an isolated incognito `BrowserContext` with separate cookies, storage, proxy, and emulation overrides."""
         ...
 
     async def stop(self) -> None:
@@ -1136,20 +1292,25 @@ __all__ = [
     "ElementDict",
     "ElementRect",
     "EventStream",
+    "FetchResponse",
     "FrameInfo",
+    "HarRecorder",
     "ImageFormat",
     "Locator",
+    "LocatorState",
     "MouseButton",
     "NetworkResponse",
     "RequestStream",
     "ResponseStream",
     "Route",
     "RouteHandler",
+    "RouteStage",
     "SpecialKey",
     "StorageState",
     "StreamedRequest",
     "StreamedResponse",
     "Tab",
+    "ViewportSize",
     "WaitUntil",
     "start",
     "sync_from_tls",

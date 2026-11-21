@@ -1,9 +1,10 @@
-"""Network routing (request interception/mocking) and live async request/response streams."""
+"""Network routing (request & response interception/mocking), live async streams, and HAR 1.2 recording."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import datetime as _dt
 import fnmatch
 import inspect
 import json as _json
@@ -29,7 +30,7 @@ def _split_proxy_creds(raw_proxy: Optional[str]) -> Optional[Tuple[str, str]]:
 
 
 class Route:
-    """Intercepted CDP Fetch request passed to a `tab.route(pattern, handler)` callback."""
+    """Intercepted CDP Fetch request or response passed to a `tab.route()` callback."""
 
     def __init__(self, tab: Any, params: Dict[str, Any]) -> None:
         self._tab = tab
@@ -42,7 +43,70 @@ class Route:
         }
         self.post_data: Optional[str] = req.get("postData")
         self.resource_type: str = str(params.get("resourceType", ""))
+        self.response_status: Optional[int] = params.get("responseStatusCode")
+        self.response_headers: Dict[str, str] = {
+            str(h.get("name", "")): str(h.get("value", ""))
+            for h in (params.get("responseHeaders") or [])
+            if isinstance(h, dict) and h.get("name")
+        }
+        self.stage: str = "response" if self.response_status is not None else "request"
         self.handled: bool = False
+        self._resp_body_cache: Optional[bytes] = None
+
+    async def response_body(self) -> bytes:
+        """Read the real server response body bytes (available when `stage == 'response'`)."""
+        if self._resp_body_cache is not None:
+            return self._resp_body_cache
+        res = await self._tab.send("Fetch.getResponseBody", {"requestId": self.request_id})
+        raw = res.get("body") or ""
+        data = base64.b64decode(raw) if res.get("base64Encoded") else str(raw).encode("utf-8")
+        self._resp_body_cache = data
+        return data
+
+    async def response_text(self, encoding: str = "utf-8") -> str:
+        """Decode the intercepted server response body as text."""
+        return (await self.response_body()).decode(encoding, errors="replace")
+
+    async def response_json(self) -> Any:
+        """Parse the intercepted server response body as JSON."""
+        return _json.loads(await self.response_text())
+
+    async def fetch(
+        self,
+        *,
+        url: Optional[str] = None,
+        method: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        body: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Perform the real upstream HTTP request via `http_tls` (if installed) or `tab.fetch()`."""
+        target_url = url or self.url
+        target_method = method or self.method
+        target_headers = headers if headers is not None else dict(self.headers)
+        target_body = body if body is not None else self.post_data
+        try:
+            async with await self._tab.tls_session(async_mode=True) as tls:
+                resp = await tls.request(
+                    target_method,
+                    target_url,
+                    headers=target_headers,
+                    data=target_body,
+                )
+                return {
+                    "url": resp.url,
+                    "status": resp.status_code,
+                    "status_text": resp.reason,
+                    "ok": resp.ok,
+                    "headers": dict(resp.headers),
+                    "body": resp.text,
+                }
+        except ImportError:
+            return await self._tab.fetch(
+                target_url,
+                method=target_method,
+                headers=target_headers,
+                body=target_body,
+            )
 
     async def continue_(
         self,
@@ -52,8 +116,11 @@ class Route:
         headers: Optional[Dict[str, str]] = None,
         post_data: Optional[Union[str, bytes]] = None,
     ) -> None:
-        """Allow the request to proceed, optionally modifying URL, method, headers, or body."""
+        """Allow the intercepted request (or response) to proceed, with optional overrides."""
         if self.handled:
+            return
+        if self.stage == "response":
+            await self.continue_response(headers=headers)
             return
         self.handled = True
         payload: Dict[str, Any] = {"requestId": self.request_id}
@@ -68,6 +135,25 @@ class Route:
             payload["postData"] = base64.b64encode(raw).decode("ascii")
         await self._tab.send("Fetch.continueRequest", payload)
 
+    async def continue_response(
+        self,
+        *,
+        status: Optional[int] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Continue an intercepted response (`stage == 'response'`) with optional status/header edits."""
+        if self.handled:
+            return
+        self.handled = True
+        payload: Dict[str, Any] = {"requestId": self.request_id}
+        if status is not None:
+            payload["responseCode"] = int(status)
+        if headers is not None:
+            payload["responseHeaders"] = [
+                {"name": str(k), "value": str(v)} for k, v in headers.items()
+            ]
+        await self._tab.send("Fetch.continueResponse", payload)
+
     async def fulfill(
         self,
         *,
@@ -77,7 +163,7 @@ class Route:
         content_type: Optional[str] = None,
         json: Any = None,
     ) -> None:
-        """Fulfill the request directly with a synthetic response (mocking API/HTML/assets)."""
+        """Fulfill the intercepted request or replace the intercepted server response."""
         if self.handled:
             return
         self.handled = True
@@ -116,20 +202,33 @@ RouteHandler = Callable[[Route], Union[None, Awaitable[None]]]
 class _RouteController:
     def __init__(self, tab: Any) -> None:
         self.tab = tab
-        self.routes: List[Tuple[str, RouteHandler]] = []
+        self.routes: List[Tuple[str, RouteHandler, str]] = []
         self._stream: Any = None
         self._task: Optional[asyncio.Task[None]] = None
         self._proxy_creds = _split_proxy_creds(getattr(tab, "proxy", None))
+        self._response_enabled: bool = False
 
     async def start(self) -> None:
+        need_response = any(stage == "response" for _, _, stage in self.routes)
+        patterns: List[Dict[str, str]] = [{"urlPattern": "*", "requestStage": "Request"}]
+        if need_response:
+            patterns.append({"urlPattern": "*", "requestStage": "Response"})
+
         if self._task is not None and not self._task.done():
+            if need_response != self._response_enabled:
+                self._response_enabled = need_response
+                await self.tab.send(
+                    "Fetch.enable",
+                    {"patterns": patterns, "handleAuthRequests": True},
+                )
             return
-        # Take clean single-owner control over Fetch events so proxy auth & routes never race
+
         self.tab._abort_auth_task()
         self._stream = self.tab._event_stream(["Fetch.requestPaused", "Fetch.authRequired"])
+        self._response_enabled = need_response
         await self.tab.send(
             "Fetch.enable",
-            {"patterns": [{"urlPattern": "*"}], "handleAuthRequests": True},
+            {"patterns": patterns, "handleAuthRequests": True},
         )
         self._task = asyncio.create_task(self._loop())
 
@@ -144,6 +243,7 @@ class _RouteController:
                 pass
             self._task = None
         self._stream = None
+        self._response_enabled = False
         try:
             await self.tab.send("Fetch.disable", {})
         except Exception:
@@ -152,8 +252,8 @@ class _RouteController:
     async def _dispatch_pause(self, params: Dict[str, Any]) -> None:
         route = Route(self.tab, params)
         try:
-            for pattern, handler in list(self.routes):
-                if _match_pattern(pattern, route.url):
+            for pattern, handler, stage in list(self.routes):
+                if stage == route.stage and _match_pattern(pattern, route.url):
                     res = handler(route)
                     if inspect.isawaitable(res):
                         await res
@@ -163,7 +263,10 @@ class _RouteController:
             pass
         if not route.handled:
             try:
-                await route.continue_()
+                if route.stage == "response":
+                    await route.continue_response()
+                else:
+                    await route.continue_()
             except Exception:
                 pass
 
@@ -201,14 +304,22 @@ class _RouteController:
 _CONTROLLERS: Dict[str, _RouteController] = {}
 
 
-async def add_route(tab: Any, url_pattern: str, handler: RouteHandler) -> None:
-    """Register a request interceptor for `url_pattern` on `tab`."""
+async def add_route(
+    tab: Any,
+    url_pattern: str,
+    handler: RouteHandler,
+    stage: str = "request",
+) -> None:
+    """Register a request or response interceptor (`stage='request'|'response'`) on `tab`."""
+    norm_stage = stage.strip().lower()
+    if norm_stage not in ("request", "response"):
+        raise ValueError(f"Unsupported route stage {stage!r}; expected 'request' or 'response'")
     sid = tab.session_id
     ctrl = _CONTROLLERS.get(sid)
     if ctrl is None:
         ctrl = _RouteController(tab)
         _CONTROLLERS[sid] = ctrl
-    ctrl.routes.append((url_pattern, handler))
+    ctrl.routes.append((url_pattern, handler, norm_stage))
     await ctrl.start()
 
 
@@ -221,10 +332,12 @@ async def remove_route(tab: Any, url_pattern: Optional[str] = None) -> None:
     if url_pattern is None:
         ctrl.routes.clear()
     else:
-        ctrl.routes = [(p, h) for (p, h) in ctrl.routes if p != url_pattern]
+        ctrl.routes = [(p, h, st) for (p, h, st) in ctrl.routes if p != url_pattern]
     if not ctrl.routes:
         await ctrl.stop()
         _CONTROLLERS.pop(sid, None)
+    else:
+        await ctrl.start()
 
 
 class StreamedRequest:
@@ -270,7 +383,6 @@ class StreamedResponse:
         if self._body_cache is not None:
             return self._body_cache
         last_err: Optional[Exception] = None
-        # Body may still be streaming right when responseReceived fires; retry briefly
         for _ in range(12):
             try:
                 res = await self._tab.send(
@@ -290,11 +402,9 @@ class StreamedResponse:
         raise RuntimeError(f"Failed to read response body for {self.url}: {last_err}")
 
     async def text(self, encoding: str = "utf-8") -> str:
-        """Decode response body as text."""
         return (await self.body()).decode(encoding, errors="replace")
 
     async def json(self) -> Any:
-        """Parse response body as JSON."""
         return _json.loads(await self.text())
 
     def __repr__(self) -> str:
@@ -391,7 +501,173 @@ class ResponseStream:
         return False
 
 
+class HarRecorder:
+    """Background HAR 1.2 traffic recorder attached to a `Tab`."""
+
+    def __init__(self, tab: Any, include_bodies: bool = True) -> None:
+        self._tab = tab
+        self._include_bodies = include_bodies
+        self._stream = tab._event_stream(
+            ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"]
+        )
+        self._pending: Dict[str, Dict[str, Any]] = {}
+        self.entries: List[Dict[str, Any]] = []
+        self._task: Optional[asyncio.Task[None]] = None
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop())
+
+    async def stop(self) -> None:
+        self._stream.close()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except BaseException:
+                pass
+            self._task = None
+
+    async def _loop(self) -> None:
+        while True:
+            ev = await self._stream.next()
+            if not ev:
+                break
+            method = ev.get("method")
+            params = ev.get("params") or {}
+            rid = str(params.get("requestId", ""))
+            if not rid:
+                continue
+            if method == "Network.requestWillBeSent":
+                req = params.get("request") or {}
+                self._pending[rid] = {
+                    "started": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                    "t0": float(params.get("timestamp") or 0.0),
+                    "method": str(req.get("method", "GET")),
+                    "url": str(req.get("url", "")),
+                    "req_headers": [
+                        {"name": str(k), "value": str(v)}
+                        for k, v in (req.get("headers") or {}).items()
+                    ],
+                    "post_data": req.get("postData"),
+                }
+            elif method == "Network.responseReceived":
+                rec = self._pending.get(rid)
+                if rec is None:
+                    continue
+                resp = params.get("response") or {}
+                rec["status"] = int(resp.get("status") or 0)
+                rec["status_text"] = str(resp.get("statusText", ""))
+                rec["protocol"] = str(resp.get("protocol", "HTTP/1.1"))
+                rec["mime_type"] = str(resp.get("mimeType", ""))
+                rec["remote_ip"] = str(resp.get("remoteIPAddress", ""))
+                rec["resp_headers"] = [
+                    {"name": str(k), "value": str(v)}
+                    for k, v in (resp.get("headers") or {}).items()
+                ]
+            elif method == "Network.loadingFinished":
+                rec = self._pending.pop(rid, None)
+                if rec is None:
+                    continue
+                t1 = float(params.get("timestamp") or rec["t0"])
+                elapsed_ms = max(0.0, round((t1 - rec["t0"]) * 1000.0, 2))
+                body_text = ""
+                body_encoding = None
+                if self._include_bodies:
+                    try:
+                        res = await self._tab.send("Network.getResponseBody", {"requestId": rid})
+                        body_text = str(res.get("body") or "")
+                        if res.get("base64Encoded"):
+                            body_encoding = "base64"
+                    except Exception:
+                        pass
+                content: Dict[str, Any] = {
+                    "size": int(params.get("encodedDataLength") or len(body_text)),
+                    "mimeType": rec.get("mime_type", ""),
+                    "text": body_text,
+                }
+                if body_encoding:
+                    content["encoding"] = body_encoding
+                entry: Dict[str, Any] = {
+                    "startedDateTime": rec["started"],
+                    "time": elapsed_ms,
+                    "serverIPAddress": rec.get("remote_ip", ""),
+                    "request": {
+                        "method": rec["method"],
+                        "url": rec["url"],
+                        "httpVersion": rec.get("protocol", "HTTP/1.1"),
+                        "headers": rec["req_headers"],
+                        "cookies": [],
+                        "queryString": [],
+                        "headersSize": -1,
+                        "bodySize": len(rec["post_data"]) if rec.get("post_data") else 0,
+                    },
+                    "response": {
+                        "status": rec.get("status", 0),
+                        "statusText": rec.get("status_text", ""),
+                        "httpVersion": rec.get("protocol", "HTTP/1.1"),
+                        "headers": rec.get("resp_headers", []),
+                        "cookies": [],
+                        "content": content,
+                        "redirectURL": "",
+                        "headersSize": -1,
+                        "bodySize": int(params.get("encodedDataLength") or 0),
+                    },
+                    "cache": {},
+                    "timings": {"send": 0, "wait": elapsed_ms, "receive": 0},
+                }
+                self.entries.append(entry)
+
+    def to_har(self) -> Dict[str, Any]:
+        return {
+            "log": {
+                "version": "1.2",
+                "creator": {"name": "best-driver", "version": "0.3.0"},
+                "entries": list(self.entries),
+            }
+        }
+
+
+_HAR_RECORDERS: Dict[str, HarRecorder] = {}
+
+
+async def start_har(tab: Any, include_bodies: bool = True) -> HarRecorder:
+    """Begin recording HAR 1.2 network transactions on `tab`."""
+    sid = tab.session_id
+    old = _HAR_RECORDERS.pop(sid, None)
+    if old is not None:
+        await old.stop()
+    rec = HarRecorder(tab, include_bodies=include_bodies)
+    _HAR_RECORDERS[sid] = rec
+    rec.start()
+    return rec
+
+
+async def export_har(tab: Any, path: Optional[str] = None) -> Dict[str, Any]:
+    """Export recorded HAR 1.2 dictionary (and optionally write to `path`)."""
+    rec = _HAR_RECORDERS.get(tab.session_id)
+    har = (
+        rec.to_har()
+        if rec is not None
+        else {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.0"}, "entries": []}}
+    )
+    if path is not None:
+        with open(path, "w", encoding="utf-8") as fh:
+            _json.dump(har, fh, indent=2)
+    return har
+
+
+async def stop_har(tab: Any) -> Dict[str, Any]:
+    """Stop HAR 1.2 recording on `tab` and return the captured HAR dictionary."""
+    rec = _HAR_RECORDERS.pop(tab.session_id, None)
+    if rec is None:
+        return {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.0"}, "entries": []}}
+    await rec.stop()
+    return rec.to_har()
+
+
 __all__ = [
+    "HarRecorder",
     "Route",
     "RouteHandler",
     "RequestStream",
@@ -400,4 +676,7 @@ __all__ = [
     "StreamedResponse",
     "add_route",
     "remove_route",
+    "start_har",
+    "export_har",
+    "stop_har",
 ]

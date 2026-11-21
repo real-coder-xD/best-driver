@@ -1,6 +1,7 @@
 from .best_driver import Browser, BrowserContext, Element, EventStream, Tab, start
 from .locator import Locator
 from .network import (
+    HarRecorder,
     RequestStream,
     ResponseStream,
     Route,
@@ -14,6 +15,7 @@ __all__ = [
     "BrowserContext",
     "Element",
     "EventStream",
+    "HarRecorder",
     "Locator",
     "RequestStream",
     "ResponseStream",

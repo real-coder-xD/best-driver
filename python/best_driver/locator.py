@@ -4,7 +4,39 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple
+
+LocatorState = Literal["attached", "visible", "hidden", "detached"]
+
+
+class _Step:
+    __slots__ = ("query", "index", "has_text", "has_not_text")
+
+    def __init__(
+        self,
+        query: str,
+        index: Optional[int] = None,
+        has_text: Optional[str] = None,
+        has_not_text: Optional[str] = None,
+    ) -> None:
+        self.query = query
+        self.index = index
+        self.has_text = has_text
+        self.has_not_text = has_not_text
+
+    def clone(
+        self,
+        *,
+        index: Any = ...,
+        has_text: Any = ...,
+        has_not_text: Any = ...,
+    ) -> "_Step":
+        return _Step(
+            self.query,
+            self.index if index is ... else index,
+            self.has_text if has_text is ... else has_text,
+            self.has_not_text if has_not_text is ... else has_not_text,
+        )
 
 
 class Locator:
@@ -18,22 +50,48 @@ class Locator:
     def __init__(
         self,
         tab: Any,
-        steps: List[Tuple[str, Optional[int]]] | List[str],
+        steps: List[Any],
     ) -> None:
         self._tab = tab
-        self._steps: List[Tuple[str, Optional[int]]] = [
-            (s, None) if isinstance(s, str) else s for s in steps
-        ]
+        self._steps: List[_Step] = []
+        for s in steps:
+            if isinstance(s, _Step):
+                self._steps.append(s)
+            elif isinstance(s, tuple):
+                self._steps.append(_Step(s[0], s[1]))
+            else:
+                self._steps.append(_Step(str(s)))
 
     def __repr__(self) -> str:
-        chain = " >> ".join(
-            f"{q}[{idx}]" if idx is not None else q for q, idx in self._steps
-        )
-        return f"<Locator {chain!r}>"
+        parts = []
+        for st in self._steps:
+            s = st.query
+            if st.has_text is not None:
+                s += f":has-text({st.has_text!r})"
+            if st.has_not_text is not None:
+                s += f":not-text({st.has_not_text!r})"
+            if st.index is not None:
+                s += f"[{st.index}]"
+            parts.append(s)
+        return f"<Locator {' >> '.join(parts)!r}>"
 
     def locator(self, query: str) -> "Locator":
         """Chain a descendant Smart Locator query (CSS, XPath, `text:`, `@attr`, Shadow DOM)."""
-        return Locator(self._tab, [*self._steps, (query, None)])
+        return Locator(self._tab, [*self._steps, _Step(query)])
+
+    def filter(
+        self,
+        *,
+        has_text: Optional[str] = None,
+        has_not_text: Optional[str] = None,
+    ) -> "Locator":
+        """Filter the current step's matched elements by substring inclusion/exclusion (case-insensitive)."""
+        steps = list(self._steps)
+        steps[-1] = steps[-1].clone(
+            has_text=has_text if has_text is not None else steps[-1].has_text,
+            has_not_text=has_not_text if has_not_text is not None else steps[-1].has_not_text,
+        )
+        return Locator(self._tab, steps)
 
     @property
     def first(self) -> "Locator":
@@ -48,37 +106,44 @@ class Locator:
     def nth(self, index: int) -> "Locator":
         """Select the `index`-th match (supports negative indexing) at the current step."""
         steps = list(self._steps)
-        q, _ = steps[-1]
-        steps[-1] = (q, index)
+        steps[-1] = steps[-1].clone(index=index)
         return Locator(self._tab, steps)
+
+    @staticmethod
+    def _apply_step_filters(nodes: List[Any], step: _Step) -> List[Any]:
+        filtered = nodes
+        if step.has_text is not None:
+            needle = step.has_text.lower()
+            filtered = [n for n in filtered if needle in (n.text or "").lower()]
+        if step.has_not_text is not None:
+            needle = step.has_not_text.lower()
+            filtered = [n for n in filtered if needle not in (n.text or "").lower()]
+        if step.index is not None:
+            try:
+                return [filtered[step.index]]
+            except IndexError:
+                return []
+        return filtered
 
     async def _resolve_all_once(self) -> List[Any]:
         if not self._steps:
             return []
-        q0, idx0 = self._steps[0]
-        nodes: List[Any] = await self._tab.eles(q0, timeout_ms=0)
-        if idx0 is not None:
-            try:
-                nodes = [nodes[idx0]]
-            except IndexError:
-                return []
-        for q, idx in self._steps[1:]:
+        s0 = self._steps[0]
+        nodes: List[Any] = await self._tab.eles(s0.query, timeout_ms=0)
+        nodes = self._apply_step_filters(nodes, s0)
+        if not nodes:
+            return []
+        for st in self._steps[1:]:
             next_nodes: List[Any] = []
             for parent in nodes:
                 try:
-                    found = await parent.eles(q)
+                    found = await parent.eles(st.query)
                 except RuntimeError:
                     continue
                 next_nodes.extend(found)
-            if not next_nodes:
+            nodes = self._apply_step_filters(next_nodes, st)
+            if not nodes:
                 return []
-            if idx is not None:
-                try:
-                    nodes = [next_nodes[idx]]
-                except IndexError:
-                    return []
-            else:
-                nodes = next_nodes
         return nodes
 
     async def _resolve_one(self, timeout_ms: int = 10000) -> Any:
@@ -124,28 +189,83 @@ class Locator:
             await asyncio.sleep(0.08)
 
     async def count(self) -> int:
-        """Return the current number of matched elements without waiting."""
         return len(await self._resolve_all_once())
 
     async def exists(self) -> bool:
-        """Return `True` if at least one matching element currently exists."""
         return (await self.count()) > 0
 
-    async def wait_for(self, timeout_ms: int = 10000) -> None:
-        """Wait until at least one element matching this locator chain exists."""
-        await self._resolve_one(timeout_ms=timeout_ms)
+    async def is_visible(self) -> bool:
+        """Return `True` if the matched element exists and has non-zero visible layout."""
+        nodes = await self._resolve_all_once()
+        if not nodes:
+            return False
+        try:
+            return bool(await nodes[0].is_visible())
+        except RuntimeError:
+            return False
 
-    async def wait_for_hidden(self, timeout_ms: int = 10000) -> None:
-        """Wait until no elements match this locator chain."""
+    async def is_enabled(self) -> bool:
+        """Return `True` if the matched element is not disabled."""
+        nodes = await self._resolve_all_once()
+        if not nodes:
+            return False
+        try:
+            return bool(await nodes[0].is_enabled())
+        except RuntimeError:
+            return False
+
+    async def is_checked(self) -> bool:
+        """Return `True` if the matched checkbox/radio is checked."""
+        nodes = await self._resolve_all_once()
+        if not nodes:
+            return False
+        try:
+            return bool(await nodes[0].is_checked())
+        except RuntimeError:
+            return False
+
+    async def wait_for(
+        self,
+        timeout_ms: int = 10000,
+        state: LocatorState = "visible",
+    ) -> None:
+        """Wait until the locator reaches `state` (`'visible'`, `'attached'`, `'hidden'`, or `'detached'`)."""
         deadline = time.monotonic() + timeout_ms / 1000.0
         while True:
-            if not await self._resolve_all_once():
-                return
+            nodes = await self._resolve_all_once()
+            if state == "attached":
+                if nodes:
+                    return
+            elif state == "detached":
+                if not nodes:
+                    return
+            elif state == "visible":
+                if nodes:
+                    try:
+                        if await nodes[0].is_visible():
+                            return
+                    except RuntimeError:
+                        pass
+            elif state == "hidden":
+                if not nodes:
+                    return
+                try:
+                    if not await nodes[0].is_visible():
+                        return
+                except RuntimeError:
+                    return
+            else:
+                raise ValueError(f"Unsupported locator state: {state!r}")
+
             if time.monotonic() >= deadline:
                 raise TimeoutError(
-                    f"Locator wait_for_hidden timed out after {timeout_ms}ms: {self!r}"
+                    f"Locator wait_for(state={state!r}) timed out after {timeout_ms}ms: {self!r}"
                 )
             await asyncio.sleep(0.08)
+
+    async def wait_for_hidden(self, timeout_ms: int = 10000) -> None:
+        """Wait until the element is detached or hidden."""
+        await self.wait_for(timeout_ms=timeout_ms, state="hidden")
 
     async def click(
         self,
@@ -153,7 +273,6 @@ class Locator:
         click_count: int = 1,
         timeout_ms: int = 10000,
     ) -> None:
-        """Resolve lazily and click via Cubic Bézier cursor physics (auto-retries stale nodes)."""
         await self._run_with_retry(
             timeout_ms, lambda el: el.click(button=button, click_count=click_count)
         )
@@ -180,6 +299,22 @@ class Locator:
 
     async def clear(self, timeout_ms: int = 10000) -> None:
         await self._run_with_retry(timeout_ms, lambda el: el.clear())
+
+    async def check(self, timeout_ms: int = 10000) -> None:
+        await self._run_with_retry(timeout_ms, lambda el: el.check())
+
+    async def uncheck(self, timeout_ms: int = 10000) -> None:
+        await self._run_with_retry(timeout_ms, lambda el: el.uncheck())
+
+    async def select_option(self, value: str, timeout_ms: int = 10000) -> None:
+        await self._run_with_retry(timeout_ms, lambda el: el.select_option(value))
+
+    async def press_key(self, key: str, timeout_ms: int = 10000) -> None:
+        async def _act(el: Any) -> None:
+            await el.click()
+            await self._tab.press_key(key)
+
+        await self._run_with_retry(timeout_ms, _act)
 
     async def text(self, timeout_ms: int = 10000) -> str:
         el = await self._resolve_one(timeout_ms=timeout_ms)
@@ -209,4 +344,4 @@ class Locator:
         return await self._run_with_retry(timeout_ms, lambda el: el.screenshot(file_path))
 
 
-__all__ = ["Locator"]
+__all__ = ["Locator", "LocatorState"]

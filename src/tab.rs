@@ -21,6 +21,7 @@ pub struct Tab {
     pub target_id: String,
     pub cdp: Arc<CdpSession>,
     proxy: Option<String>,
+    browser_context_id: Option<String>,
     frame_chain: Vec<String>,
     mouse: StdMutex<(f64, f64)>,
     last_remote_ip: StdMutex<Option<String>>,
@@ -45,6 +46,7 @@ impl Tab {
         target_id: String,
         cdp: Arc<CdpSession>,
         proxy: Option<String>,
+        browser_context_id: Option<String>,
     ) -> DriverResult<Self> {
         // Intentionally omit `Runtime.enable` so V8 never fires console serialization hooks
         // probed by anti-bot scripts (`console.debug(err)` / `Error.stack` getter traps).
@@ -56,6 +58,7 @@ impl Tab {
             target_id,
             cdp,
             proxy,
+            browser_context_id,
             frame_chain: Vec::new(),
             mouse: StdMutex::new((0.0, 0.0)),
             last_remote_ip: StdMutex::new(None),
@@ -74,6 +77,10 @@ impl Tab {
 
     pub fn proxy(&self) -> Option<&str> {
         self.proxy.as_deref()
+    }
+
+    pub fn context_id(&self) -> Option<&str> {
+        self.browser_context_id.as_deref()
     }
 
     // ───────────────────────────── Navigation ─────────────────────────────
@@ -241,7 +248,7 @@ impl Tab {
                     "Page.createIsolatedWorld",
                     json!({
                         "frameId": fid,
-                        "worldName": "best_driver_frame",
+                        "worldName": "",
                         "grantUniveralAccess": true
                     }),
                 )
@@ -919,6 +926,68 @@ impl Tab {
         ).await.map(|_| ())
     }
 
+    pub async fn is_visible_node(&self, backend_node_id: i64) -> DriverResult<bool> {
+        let v = self.call_on_node(
+            backend_node_id,
+            "function() { \
+                const s = getComputedStyle(this); \
+                if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) === 0) return false; \
+                const r = this.getBoundingClientRect(); \
+                return r.width > 0 && r.height > 0; \
+            }",
+            vec![],
+        ).await?;
+        Ok(v == Value::Bool(true))
+    }
+
+    pub async fn is_enabled_node(&self, backend_node_id: i64) -> DriverResult<bool> {
+        let v = self.call_on_node(
+            backend_node_id,
+            "function() { return !this.disabled && this.getAttribute('aria-disabled') !== 'true'; }",
+            vec![],
+        ).await?;
+        Ok(v == Value::Bool(true))
+    }
+
+    pub async fn is_checked_node(&self, backend_node_id: i64) -> DriverResult<bool> {
+        let v = self.call_on_node(
+            backend_node_id,
+            "function() { return Boolean(this.checked || this.getAttribute('aria-checked') === 'true'); }",
+            vec![],
+        ).await?;
+        Ok(v == Value::Bool(true))
+    }
+
+    pub async fn check_node(&self, backend_node_id: i64, checked: bool) -> DriverResult<()> {
+        if self.is_checked_node(backend_node_id).await? != checked {
+            self.click_node(backend_node_id, "left", 1).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn select_option_node(&self, backend_node_id: i64, value: &str) -> DriverResult<()> {
+        let ok = self.call_on_node(
+            backend_node_id,
+            "function(v) { \
+                const opts = Array.from(this.options || []); \
+                const opt = opts.find(o => o.value === v || o.text.trim() === v); \
+                if (!opt) return false; \
+                this.value = opt.value; \
+                this.dispatchEvent(new Event('input', { bubbles: true })); \
+                this.dispatchEvent(new Event('change', { bubbles: true })); \
+                return true; \
+            }",
+            vec![json!({ "value": value })],
+        ).await?;
+        if ok != Value::Bool(true) {
+            return Err(DriverError::NotFound(format!(
+                "Không tìm thấy option '{}' trên node {}",
+                value, backend_node_id
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn screenshot_node(&self, backend_node_id: i64, file_path: Option<String>) -> DriverResult<Vec<u8>> {
         let r = self.call_on_node(
             backend_node_id,
@@ -1163,7 +1232,13 @@ impl Tab {
                     .await?;
                 if let Some(sid) = attached.get("sessionId").and_then(|v| v.as_str()) {
                     let child_session = self.cdp.connection().session(sid.to_string());
-                    return Tab::new(fid, child_session, self.proxy.clone()).await;
+                    return Tab::new(
+                        fid,
+                        child_session,
+                        self.proxy.clone(),
+                        self.browser_context_id.clone(),
+                    )
+                    .await;
                 }
             }
         }
@@ -1175,6 +1250,7 @@ impl Tab {
             target_id: self.target_id.clone(),
             cdp: Arc::clone(&self.cdp),
             proxy: self.proxy.clone(),
+            browser_context_id: self.browser_context_id.clone(),
             frame_chain: chain,
             mouse: StdMutex::new((0.0, 0.0)),
             last_remote_ip: StdMutex::new(None),
@@ -1627,6 +1703,59 @@ impl Tab {
         }
     }
 
+    pub async fn add_init_script(&self, source: &str) -> DriverResult<String> {
+        let res = self
+            .cdp
+            .call("Page.addScriptToEvaluateOnNewDocument", json!({ "source": source }))
+            .await?;
+        Ok(res
+            .get("identifier")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Executes a real in-browser `fetch()` using Chromium's native TLS stack, HTTP/2, and cookie jar.
+    pub async fn fetch(
+        &self,
+        url: &str,
+        method: &str,
+        headers: Option<Value>,
+        body: Option<String>,
+        credentials: &str,
+    ) -> DriverResult<Value> {
+        let hdrs_json = headers.unwrap_or_else(|| json!({}));
+        let body_json = match body {
+            Some(b) => json!(b),
+            None => Value::Null,
+        };
+        let expr = format!(
+            "(async () => {{ \
+                const opts = {{ method: {}, headers: {}, credentials: {} }}; \
+                const rawBody = {}; \
+                if (rawBody !== null) opts.body = rawBody; \
+                const resp = await fetch({}, opts); \
+                const hdrs = {{}}; \
+                resp.headers.forEach((v, k) => {{ hdrs[k] = v; }}); \
+                const text = await resp.text(); \
+                return {{ \
+                    url: resp.url, \
+                    status: resp.status, \
+                    status_text: resp.statusText, \
+                    ok: resp.ok, \
+                    headers: hdrs, \
+                    body: text \
+                }}; \
+            }})()",
+            js_str(method),
+            hdrs_json,
+            js_str(credentials),
+            body_json,
+            js_str(url)
+        );
+        self.evaluate(&expr).await
+    }
+
     // ───────────────────────────── Fingerprint & TLS Session Handoff ─────────────────────────────
 
     /// Captures the live browser's HTTP/TLS identity (`impersonate`, `user_agent`, `sec_ch_ua*`,
@@ -1755,6 +1884,17 @@ impl Tab {
     pub async fn get_cookies(&self, urls: Option<Vec<String>>) -> DriverResult<Value> {
         let res = if let Some(u) = urls {
             self.cdp.call("Network.getCookies", json!({ "urls": u })).await?
+        } else if let Some(ref cid) = self.browser_context_id {
+            // In an isolated BrowserContext, Storage.getCookies MUST pass `browserContextId`;
+            // omitting it causes Chromium to return the default context's cookies instead.
+            match self
+                .cdp
+                .call_browser("Storage.getCookies", json!({ "browserContextId": cid }))
+                .await
+            {
+                Ok(v) => v,
+                Err(_) => self.cdp.call("Network.getCookies", json!({})).await?,
+            }
         } else {
             match self.cdp.call("Storage.getCookies", json!({})).await {
                 Ok(v) => v,
@@ -1793,6 +1933,19 @@ impl Tab {
             }
             clean.push(Value::Object(m));
         }
+        if let Some(ref cid) = self.browser_context_id {
+            if self
+                .cdp
+                .call_browser(
+                    "Storage.setCookies",
+                    json!({ "cookies": clean, "browserContextId": cid }),
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
         self.cdp.call("Network.setCookies", json!({ "cookies": clean })).await.map(|_| ())
     }
 
@@ -1828,6 +1981,16 @@ impl Tab {
     }
 
     pub async fn clear_cookies(&self) -> DriverResult<()> {
+        if let Some(ref cid) = self.browser_context_id {
+            if self
+                .cdp
+                .call_browser("Storage.clearCookies", json!({ "browserContextId": cid }))
+                .await
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
         self.cdp.call("Network.clearBrowserCookies", json!({})).await.map(|_| ())
     }
 
