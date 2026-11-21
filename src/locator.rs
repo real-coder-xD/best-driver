@@ -19,10 +19,97 @@ pub fn attr_to_css(attr_part: &str) -> String {
     }
 }
 
-/// Smart locator resolver supporting XPath, Text, Attributes, Shadow DOM, and standard CSS.
-pub fn sel_expr(selector: &str) -> String {
+/// Split a Smart Locator on top-level commas (outside quotes, `[]`, and `()`).
+///
+/// Preserves literal commas in single `text:` / `t:` queries (e.g. `"text:Hello, world"`)
+/// unless at least one subsequent branch starts with a Smart Locator or CSS-sigil prefix.
+pub fn split_locator_branches(selector: &str) -> Vec<&str> {
     let s = selector.trim();
-    if s.starts_with("//") || s.starts_with("(//") || s.starts_with(".//") {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let bytes = s.as_bytes();
+    let mut branches = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if (in_single || in_double) && b == b'\\' {
+            escape = true;
+            continue;
+        }
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'[' if !in_single && !in_double => bracket_depth += 1,
+            b']' if !in_single && !in_double => bracket_depth = bracket_depth.saturating_sub(1),
+            b'(' if !in_single && !in_double => paren_depth += 1,
+            b')' if !in_single && !in_double => paren_depth = paren_depth.saturating_sub(1),
+            b',' if !in_single && !in_double && bracket_depth == 0 && paren_depth == 0 => {
+                let part = s[start..i].trim();
+                if !part.is_empty() {
+                    branches.push(part);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        branches.push(tail);
+    }
+
+    if branches.len() > 1 && (s.starts_with("text:") || s.starts_with("t:")) {
+        let has_explicit_branch = branches[1..].iter().any(|b| {
+            b.starts_with('@')
+                || b.starts_with("text:")
+                || b.starts_with("t:")
+                || b.starts_with("//")
+                || b.starts_with("(//")
+                || b.starts_with(".//")
+                || b.starts_with('#')
+                || b.starts_with('.')
+                || b.starts_with('[')
+        });
+        if !has_explicit_branch {
+            return vec![s];
+        }
+    }
+
+    branches
+}
+
+#[inline]
+fn is_xpath(s: &str) -> bool {
+    s.starts_with("//") || s.starts_with("(//") || s.starts_with(".//")
+}
+
+#[inline]
+fn strip_text_prefix(s: &str) -> Option<&str> {
+    s.strip_prefix("text:").or_else(|| s.strip_prefix("t:"))
+}
+
+fn branch_to_css(b: &str) -> Option<String> {
+    if is_xpath(b) || strip_text_prefix(b).is_some() {
+        None
+    } else if let Some(attr_part) = b.strip_prefix('@') {
+        Some(attr_to_css(attr_part))
+    } else {
+        Some(b.to_string())
+    }
+}
+
+fn sel_single_expr(s: &str) -> String {
+    if is_xpath(s) {
         format!(
             "(() => {{ \
                 const r = document.evaluate({}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null); \
@@ -30,7 +117,7 @@ pub fn sel_expr(selector: &str) -> String {
             }})()",
             js_str(s)
         )
-    } else if let Some(txt) = s.strip_prefix("text:").or_else(|| s.strip_prefix("t:")) {
+    } else if let Some(txt) = strip_text_prefix(s) {
         format!(
             "(() => {{ \
                 const target = {}.trim().toLowerCase(); \
@@ -51,20 +138,16 @@ pub fn sel_expr(selector: &str) -> String {
             js_str(txt)
         )
     } else {
-        let css_sel = if let Some(attr_part) = s.strip_prefix('@') {
-            attr_to_css(attr_part)
-        } else {
-            s.to_string()
-        };
+        let css_sel = branch_to_css(s).unwrap_or_else(|| s.to_string());
         format!(
             "(() => {{ \
                 const sel = {}; \
-                const direct = document.querySelector(sel); \
-                if (direct) return direct; \
+                try {{ const direct = document.querySelector(sel); if (direct) return direct; }} catch (_) {{}} \
                 function queryDeep(root, q) {{ \
                     for (const child of root.querySelectorAll('*')) {{ \
                         if (child.shadowRoot) {{ \
-                            const found = child.shadowRoot.querySelector(q) || queryDeep(child.shadowRoot, q); \
+                            try {{ const direct = child.shadowRoot.querySelector(q); if (direct) return direct; }} catch (_) {{}} \
+                            const found = queryDeep(child.shadowRoot, q); \
                             if (found) return found; \
                         }} \
                     }} \
@@ -77,10 +160,8 @@ pub fn sel_expr(selector: &str) -> String {
     }
 }
 
-/// Multi-element smart locator resolver supporting XPath, Text, Attributes, Shadow DOM, and CSS.
-pub fn sel_all_expr(selector: &str) -> String {
-    let s = selector.trim();
-    if s.starts_with("//") || s.starts_with("(//") || s.starts_with(".//") {
+fn sel_single_all_expr(s: &str) -> String {
+    if is_xpath(s) {
         format!(
             "(() => {{ \
                 const snap = document.evaluate({}, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); \
@@ -93,7 +174,7 @@ pub fn sel_all_expr(selector: &str) -> String {
             }})()",
             js_str(s)
         )
-    } else if let Some(txt) = s.strip_prefix("text:").or_else(|| s.strip_prefix("t:")) {
+    } else if let Some(txt) = strip_text_prefix(s) {
         format!(
             "(() => {{ \
                 const target = {}.trim().toLowerCase(); \
@@ -112,11 +193,7 @@ pub fn sel_all_expr(selector: &str) -> String {
             js_str(txt)
         )
     } else {
-        let css_sel = if let Some(attr_part) = s.strip_prefix('@') {
-            attr_to_css(attr_part)
-        } else {
-            s.to_string()
-        };
+        let css_sel = branch_to_css(s).unwrap_or_else(|| s.to_string());
         format!(
             "(() => {{ \
                 const sel = {}; \
@@ -135,121 +212,259 @@ pub fn sel_all_expr(selector: &str) -> String {
     }
 }
 
-/// Returns `(functionDeclaration, argument)` for querying a single child relative to `this` (including `this.shadowRoot`).
-pub fn child_sel_fn(query: &str) -> (&'static str, String) {
-    let s = query.trim();
-    if s.starts_with("//") || s.starts_with("(//") || s.starts_with(".//") {
-        (
-            "function(xp) { \
-                const r = document.evaluate(xp, this, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null); \
+/// Smart locator resolver supporting XPath, Text, Attributes, Shadow DOM, standard CSS, and comma-separated mixed branches.
+pub fn sel_expr(selector: &str) -> String {
+    let branches = split_locator_branches(selector);
+    if branches.is_empty() {
+        return "null".to_string();
+    }
+    if branches.len() == 1 {
+        return sel_single_expr(branches[0]);
+    }
+    // Fast path: all branches are CSS or `@attr` -> combine into a single valid CSS selector list
+    if let Some(css_parts) = branches.iter().map(|b| branch_to_css(b)).collect::<Option<Vec<_>>>() {
+        return sel_single_expr(&css_parts.join(", "));
+    }
+    let mut body = String::from("(() => { ");
+    for b in branches {
+        body.push_str("try { const r = ");
+        body.push_str(&sel_single_expr(b));
+        body.push_str("; if (r) return r; } catch (_) {} ");
+    }
+    body.push_str("return null; })()");
+    body
+}
+
+/// Multi-element smart locator resolver supporting XPath, Text, Attributes, Shadow DOM, CSS, and comma-separated mixed branches.
+pub fn sel_all_expr(selector: &str) -> String {
+    let branches = split_locator_branches(selector);
+    if branches.is_empty() {
+        return "[]".to_string();
+    }
+    if branches.len() == 1 {
+        return sel_single_all_expr(branches[0]);
+    }
+    if let Some(css_parts) = branches.iter().map(|b| branch_to_css(b)).collect::<Option<Vec<_>>>() {
+        return sel_single_all_expr(&css_parts.join(", "));
+    }
+    let mut body = String::from("(() => { const out = []; const seen = new Set(); ");
+    for b in branches {
+        body.push_str("try { for (const el of ");
+        body.push_str(&sel_single_all_expr(b));
+        body.push_str(") { if (el && !seen.has(el)) { seen.add(el); out.push(el); } } } catch (_) {} ");
+    }
+    body.push_str("return out; })()");
+    body
+}
+
+const CHILD_XPATH_ONE_FN: &str = "function(xp) { \
+    const r = document.evaluate(xp, this, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null); \
+    const el = r.singleNodeValue; \
+    return (el && el.nodeType === 1) ? el : null; \
+}";
+
+const CHILD_TEXT_ONE_FN: &str = "function(t) { \
+    const target = t.trim().toLowerCase(); \
+    let best = null; \
+    function walk(root) { \
+        for (const el of root.querySelectorAll('*')) { \
+            if (el.shadowRoot) walk(el.shadowRoot); \
+            if (el.getClientRects().length === 0) continue; \
+            const c = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase(); \
+            if (c.includes(target)) { if (!best || best.contains(el)) best = el; } \
+        } \
+    } \
+    walk(this); \
+    if (this.shadowRoot) walk(this.shadowRoot); \
+    return best; \
+}";
+
+const CHILD_CSS_ONE_FN: &str = "function(sel) { \
+    function queryDeep(root, q) { \
+        try { const direct = root.querySelector(q); if (direct) return direct; } catch (_) {} \
+        for (const child of root.querySelectorAll('*')) { \
+            if (child.shadowRoot) { \
+                const found = queryDeep(child.shadowRoot, q); \
+                if (found) return found; \
+            } \
+        } \
+        return null; \
+    } \
+    const direct = queryDeep(this, sel); \
+    if (direct) return direct; \
+    return this.shadowRoot ? queryDeep(this.shadowRoot, sel) : null; \
+}";
+
+const CHILD_MIXED_ONE_FN: &str = "function(branches) { \
+    const self = this; \
+    function queryDeep(root, q) { \
+        try { const d = root.querySelector(q); if (d) return d; } catch (_) {} \
+        for (const c of root.querySelectorAll('*')) { \
+            if (c.shadowRoot) { const f = queryDeep(c.shadowRoot, q); if (f) return f; } \
+        } \
+        return null; \
+    } \
+    for (const b of branches) { \
+        try { \
+            if (b.k === 'xpath') { \
+                const r = document.evaluate(b.v, self, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null); \
                 const el = r.singleNodeValue; \
-                return (el && el.nodeType === 1) ? el : null; \
-            }",
-            s.to_string(),
-        )
-    } else if let Some(txt) = s.strip_prefix("text:").or_else(|| s.strip_prefix("t:")) {
-        (
-            "function(t) { \
-                const target = t.trim().toLowerCase(); \
+                if (el && el.nodeType === 1) return el; \
+            } else if (b.k === 'text') { \
+                const target = b.v.trim().toLowerCase(); \
                 let best = null; \
-                function walk(root) { \
+                const walk = (root) => { \
                     for (const el of root.querySelectorAll('*')) { \
                         if (el.shadowRoot) walk(el.shadowRoot); \
                         if (el.getClientRects().length === 0) continue; \
                         const c = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase(); \
                         if (c.includes(target)) { if (!best || best.contains(el)) best = el; } \
                     } \
-                } \
-                walk(this); \
-                if (this.shadowRoot) walk(this.shadowRoot); \
-                return best; \
-            }",
-            txt.to_string(),
-        )
-    } else {
-        let css_sel = if let Some(attr_part) = s.strip_prefix('@') {
-            attr_to_css(attr_part)
-        } else {
-            s.to_string()
-        };
-        (
-            "function(sel) { \
-                function queryDeep(root, q) { \
-                    try { const direct = root.querySelector(q); if (direct) return direct; } catch (_) {} \
-                    for (const child of root.querySelectorAll('*')) { \
-                        if (child.shadowRoot) { \
-                            const found = queryDeep(child.shadowRoot, q); \
-                            if (found) return found; \
-                        } \
-                    } \
-                    return null; \
-                } \
-                const direct = queryDeep(this, sel); \
-                if (direct) return direct; \
-                return this.shadowRoot ? queryDeep(this.shadowRoot, sel) : null; \
-            }",
-            css_sel,
-        )
-    }
-}
+                }; \
+                walk(self); \
+                if (self.shadowRoot) walk(self.shadowRoot); \
+                if (best) return best; \
+            } else { \
+                const found = queryDeep(self, b.v) || (self.shadowRoot ? queryDeep(self.shadowRoot, b.v) : null); \
+                if (found) return found; \
+            } \
+        } catch (_) {} \
+    } \
+    return null; \
+}";
 
-/// Returns `(functionDeclaration, argument)` for querying all children relative to `this` (including `this.shadowRoot`).
-pub fn child_sel_all_fn(query: &str) -> (&'static str, String) {
-    let s = query.trim();
-    if s.starts_with("//") || s.starts_with("(//") || s.starts_with(".//") {
-        (
-            "function(xp) { \
-                const snap = document.evaluate(xp, this, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); \
-                const list = []; \
+const CHILD_XPATH_ALL_FN: &str = "function(xp) { \
+    const snap = document.evaluate(xp, this, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); \
+    const list = []; \
+    for (let i = 0; i < snap.snapshotLength; i++) { \
+        const el = snap.snapshotItem(i); \
+        if (el && el.nodeType === 1) list.push(el); \
+    } \
+    return list; \
+}";
+
+const CHILD_TEXT_ALL_FN: &str = "function(t) { \
+    const target = t.trim().toLowerCase(); \
+    const list = []; \
+    function walk(root) { \
+        for (const el of root.querySelectorAll('*')) { \
+            if (el.shadowRoot) walk(el.shadowRoot); \
+            if (el.getClientRects().length === 0) continue; \
+            const c = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase(); \
+            if (c.includes(target)) list.push(el); \
+        } \
+    } \
+    walk(this); \
+    if (this.shadowRoot) walk(this.shadowRoot); \
+    return list; \
+}";
+
+const CHILD_CSS_ALL_FN: &str = "function(sel) { \
+    const list = []; \
+    function queryDeepAll(root) { \
+        try { for (const el of root.querySelectorAll(sel)) list.push(el); } catch (_) {} \
+        for (const child of root.querySelectorAll('*')) { \
+            if (child.shadowRoot) queryDeepAll(child.shadowRoot); \
+        } \
+    } \
+    queryDeepAll(this); \
+    if (this.shadowRoot) queryDeepAll(this.shadowRoot); \
+    return list; \
+}";
+
+const CHILD_MIXED_ALL_FN: &str = "function(branches) { \
+    const self = this; \
+    const out = []; \
+    const seen = new Set(); \
+    const add = (el) => { if (el && !seen.has(el)) { seen.add(el); out.push(el); } }; \
+    function queryDeepAll(root, q) { \
+        try { for (const el of root.querySelectorAll(q)) add(el); } catch (_) {} \
+        for (const c of root.querySelectorAll('*')) { if (c.shadowRoot) queryDeepAll(c.shadowRoot, q); } \
+    } \
+    for (const b of branches) { \
+        try { \
+            if (b.k === 'xpath') { \
+                const snap = document.evaluate(b.v, self, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null); \
                 for (let i = 0; i < snap.snapshotLength; i++) { \
                     const el = snap.snapshotItem(i); \
-                    if (el && el.nodeType === 1) list.push(el); \
+                    if (el && el.nodeType === 1) add(el); \
                 } \
-                return list; \
-            }",
-            s.to_string(),
-        )
-    } else if let Some(txt) = s.strip_prefix("text:").or_else(|| s.strip_prefix("t:")) {
-        (
-            "function(t) { \
-                const target = t.trim().toLowerCase(); \
-                const list = []; \
-                function walk(root) { \
+            } else if (b.k === 'text') { \
+                const target = b.v.trim().toLowerCase(); \
+                const walk = (root) => { \
                     for (const el of root.querySelectorAll('*')) { \
                         if (el.shadowRoot) walk(el.shadowRoot); \
                         if (el.getClientRects().length === 0) continue; \
                         const c = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase(); \
-                        if (c.includes(target)) list.push(el); \
+                        if (c.includes(target)) add(el); \
                     } \
-                } \
-                walk(this); \
-                if (this.shadowRoot) walk(this.shadowRoot); \
-                return list; \
-            }",
-            txt.to_string(),
-        )
-    } else {
-        let css_sel = if let Some(attr_part) = s.strip_prefix('@') {
-            attr_to_css(attr_part)
+                }; \
+                walk(self); \
+                if (self.shadowRoot) walk(self.shadowRoot); \
+            } else { \
+                queryDeepAll(self, b.v); \
+                if (self.shadowRoot) queryDeepAll(self.shadowRoot, b.v); \
+            } \
+        } catch (_) {} \
+    } \
+    return out; \
+}";
+
+fn encode_mixed_branches(branches: &[&str]) -> serde_json::Value {
+    let items: Vec<serde_json::Value> = branches
+        .iter()
+        .map(|b| {
+            if is_xpath(b) {
+                serde_json::json!({ "k": "xpath", "v": *b })
+            } else if let Some(txt) = strip_text_prefix(b) {
+                serde_json::json!({ "k": "text", "v": txt })
+            } else {
+                let css = branch_to_css(b).unwrap_or_else(|| (*b).to_string());
+                serde_json::json!({ "k": "css", "v": css })
+            }
+        })
+        .collect();
+    serde_json::Value::Array(items)
+}
+
+/// Returns `(functionDeclaration, argument)` for querying a single child relative to `this` (including `this.shadowRoot`).
+pub fn child_sel_fn(query: &str) -> (&'static str, serde_json::Value) {
+    let branches = split_locator_branches(query);
+    if branches.len() == 1 {
+        let s = branches[0];
+        if is_xpath(s) {
+            return (CHILD_XPATH_ONE_FN, serde_json::Value::String(s.to_string()));
+        } else if let Some(txt) = strip_text_prefix(s) {
+            return (CHILD_TEXT_ONE_FN, serde_json::Value::String(txt.to_string()));
         } else {
-            s.to_string()
-        };
-        (
-            "function(sel) { \
-                const list = []; \
-                function queryDeepAll(root) { \
-                    try { for (const el of root.querySelectorAll(sel)) list.push(el); } catch (_) {} \
-                    for (const child of root.querySelectorAll('*')) { \
-                        if (child.shadowRoot) queryDeepAll(child.shadowRoot); \
-                    } \
-                } \
-                queryDeepAll(this); \
-                if (this.shadowRoot) queryDeepAll(this.shadowRoot); \
-                return list; \
-            }",
-            css_sel,
-        )
+            let css = branch_to_css(s).unwrap_or_else(|| s.to_string());
+            return (CHILD_CSS_ONE_FN, serde_json::Value::String(css));
+        }
     }
+    if let Some(css_parts) = branches.iter().map(|b| branch_to_css(b)).collect::<Option<Vec<_>>>() {
+        return (CHILD_CSS_ONE_FN, serde_json::Value::String(css_parts.join(", ")));
+    }
+    (CHILD_MIXED_ONE_FN, encode_mixed_branches(&branches))
+}
+
+/// Returns `(functionDeclaration, argument)` for querying all children relative to `this` (including `this.shadowRoot`).
+pub fn child_sel_all_fn(query: &str) -> (&'static str, serde_json::Value) {
+    let branches = split_locator_branches(query);
+    if branches.len() == 1 {
+        let s = branches[0];
+        if is_xpath(s) {
+            return (CHILD_XPATH_ALL_FN, serde_json::Value::String(s.to_string()));
+        } else if let Some(txt) = strip_text_prefix(s) {
+            return (CHILD_TEXT_ALL_FN, serde_json::Value::String(txt.to_string()));
+        } else {
+            let css = branch_to_css(s).unwrap_or_else(|| s.to_string());
+            return (CHILD_CSS_ALL_FN, serde_json::Value::String(css));
+        }
+    }
+    if let Some(css_parts) = branches.iter().map(|b| branch_to_css(b)).collect::<Option<Vec<_>>>() {
+        return (CHILD_CSS_ALL_FN, serde_json::Value::String(css_parts.join(", ")));
+    }
+    (CHILD_MIXED_ALL_FN, encode_mixed_branches(&branches))
 }
 
 pub const NODE_META_FN: &str = "function() { \
@@ -397,17 +612,13 @@ fn matches_simple_css(node: &serde_json::Value, sel: &str) -> bool {
     matched_any
 }
 
-/// Walks a `DOM.getDocument({ depth: -1, pierce: true })` tree (including `#shadow-root (closed)`)
-/// and returns matching `backendNodeId`s for CSS, `@attr=val`, or `text:`/`t:` queries.
-pub fn find_pierced_backend_node_ids(root: &serde_json::Value, query: &str) -> Vec<i64> {
-    let s = query.trim();
-    if s.is_empty() || s.starts_with("//") || s.starts_with("(//") || s.starts_with(".//") {
-        return Vec::new();
+fn find_pierced_single_branch(root: &serde_json::Value, s: &str, out: &mut Vec<i64>) {
+    if s.is_empty() || is_xpath(s) {
+        return;
     }
 
-    if let Some(txt) = s.strip_prefix("text:").or_else(|| s.strip_prefix("t:")) {
+    if let Some(txt) = strip_text_prefix(s) {
         let needle = txt.trim().to_lowercase();
-        let mut out = Vec::new();
         fn walk_text(node: &serde_json::Value, needle: &str, out: &mut Vec<i64>) -> bool {
             let mut child_matched = false;
             if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
@@ -437,30 +648,27 @@ pub fn find_pierced_backend_node_ids(root: &serde_json::Value, query: &str) -> V
                 cdp_collect_text(node, &mut text);
                 if text.trim().to_lowercase().contains(needle) {
                     if let Some(bid) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
-                        out.push(bid);
+                        if !out.contains(&bid) {
+                            out.push(bid);
+                        }
                         return true;
                     }
                 }
             }
             false
         }
-        walk_text(root, &needle, &mut out);
-        return out;
+        walk_text(root, &needle, out);
+        return;
     }
 
-    let css = if let Some(attr_part) = s.strip_prefix('@') {
-        attr_to_css(attr_part)
-    } else {
-        s.to_string()
-    };
+    let css = branch_to_css(s).unwrap_or_else(|| s.to_string());
 
     // Support whitespace-separated descendant selectors (e.g. `form input[type="checkbox"]`)
     let parts: Vec<&str> = css.split_whitespace().filter(|p| *p != ">").collect();
     if parts.is_empty() {
-        return Vec::new();
+        return;
     }
 
-    let mut out = Vec::new();
     fn walk_css<'a>(
         node: &'a serde_json::Value,
         parts: &[&str],
@@ -473,7 +681,9 @@ pub fn find_pierced_backend_node_ids(root: &serde_json::Value, query: &str) -> V
             let mut need = parts.len() - 1;
             if need == 0 {
                 if let Some(bid) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
-                    out.push(bid);
+                    if !out.contains(&bid) {
+                        out.push(bid);
+                    }
                 }
             } else {
                 for anc in ancestors.iter().rev() {
@@ -486,7 +696,9 @@ pub fn find_pierced_backend_node_ids(root: &serde_json::Value, query: &str) -> V
                 }
                 if need == 0 {
                     if let Some(bid) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
-                        out.push(bid);
+                        if !out.contains(&bid) {
+                            out.push(bid);
+                        }
                     }
                 }
             }
@@ -514,7 +726,17 @@ pub fn find_pierced_backend_node_ids(root: &serde_json::Value, query: &str) -> V
     }
 
     let mut ancestors = Vec::new();
-    walk_css(root, &parts, &mut ancestors, &mut out);
+    walk_css(root, &parts, &mut ancestors, out);
+}
+
+/// Walks a `DOM.getDocument({ depth: -1, pierce: true })` tree (including `#shadow-root (closed)`)
+/// and returns matching `backendNodeId`s for CSS, `@attr=val`, `text:`/`t:`, and comma-separated mixed queries.
+pub fn find_pierced_backend_node_ids(root: &serde_json::Value, query: &str) -> Vec<i64> {
+    let branches = split_locator_branches(query);
+    let mut out = Vec::new();
+    for b in branches {
+        find_pierced_single_branch(root, b, &mut out);
+    }
     out
 }
 
@@ -532,27 +754,63 @@ mod tests {
     }
 
     #[test]
+    fn split_locator_branches_respects_quotes_brackets_parens_and_text_commas() {
+        assert_eq!(
+            split_locator_branches("input[type='email'], @placeholder=Email"),
+            vec!["input[type='email']", "@placeholder=Email"]
+        );
+        assert_eq!(
+            split_locator_branches("input[placeholder='First, Last'], @name=full"),
+            vec!["input[placeholder='First, Last']", "@name=full"]
+        );
+        assert_eq!(split_locator_branches(":is(.a, .b)"), vec![":is(.a, .b)"]);
+        assert_eq!(
+            split_locator_branches("text:Hello, world"),
+            vec!["text:Hello, world"]
+        );
+        assert_eq!(
+            split_locator_branches("text:Sign In, @id=login"),
+            vec!["text:Sign In", "@id=login"]
+        );
+    }
+
+    #[test]
     fn sel_expr_routes_all_locator_syntaxes() {
         assert!(sel_expr("//button[@id='ok']").contains("document.evaluate"));
         assert!(sel_expr("text:Sign In").contains("innerText"));
         assert!(sel_expr("t:Submit").contains("innerText"));
         assert!(sel_expr("@name=q").contains("[name=\\\"q\\\"]"));
         assert!(sel_expr("#login").contains("queryDeep"));
+        // Mixed CSS + @attr merges cleanly into a single CSS selector list
+        let mixed_css = sel_expr("input[type='email'], @placeholder=Email");
+        assert!(mixed_css.contains("input[type='email'], [placeholder=\\\"Email\\\"]"));
+        // Mixed CSS + text: evaluates both branches sequentially
+        let mixed_text = sel_expr("#missing, text:Sign In");
+        assert!(mixed_text.contains("#missing"));
+        assert!(mixed_text.contains("Sign In"));
     }
 
     #[test]
     fn child_sel_fn_dispatches_correctly() {
         let (f_xp, arg_xp) = child_sel_fn(".//span");
         assert!(f_xp.contains("document.evaluate"));
-        assert_eq!(arg_xp, ".//span");
+        assert_eq!(arg_xp, json!(".//span"));
 
         let (f_txt, arg_txt) = child_sel_fn("text:Hello");
         assert!(f_txt.contains("shadowRoot"));
-        assert_eq!(arg_txt, "Hello");
+        assert_eq!(arg_txt, json!("Hello"));
 
         let (f_attr, arg_attr) = child_sel_fn("@data-id=42");
         assert!(f_attr.contains("queryDeep"));
-        assert_eq!(arg_attr, "[data-id=\"42\"]");
+        assert_eq!(arg_attr, json!("[data-id=\"42\"]"));
+
+        let (f_mix_css, arg_mix_css) = child_sel_fn("input[type='email'], @placeholder=Email");
+        assert!(f_mix_css.contains("queryDeep"));
+        assert_eq!(arg_mix_css, json!("input[type='email'], [placeholder=\"Email\"]"));
+
+        let (f_mix, arg_mix) = child_sel_fn("#none, text:Submit");
+        assert!(f_mix.contains("b.k === 'text'"));
+        assert_eq!(arg_mix, json!([{ "k": "css", "v": "#none" }, { "k": "text", "v": "Submit" }]));
     }
 
     #[test]
@@ -577,7 +835,7 @@ mod tests {
                                 "nodeType": 1,
                                 "localName": "input",
                                 "backendNodeId": 21,
-                                "attributes": ["id", "cf-cb", "type", "checkbox"]
+                                "attributes": ["id", "cf-cb", "type", "checkbox", "placeholder", "Email"]
                             },
                             {
                                 "nodeType": 3,
@@ -597,5 +855,13 @@ mod tests {
         assert_eq!(find_pierced_backend_node_ids(&doc, "input[type^=\"check\"]"), vec![21]);
         assert_eq!(find_pierced_backend_node_ids(&doc, "input[type$=\"box\"]"), vec![21]);
         assert_eq!(find_pierced_backend_node_ids(&doc, "text:Verify you are human"), vec![20]);
+        assert_eq!(
+            find_pierced_backend_node_ids(&doc, "input[type='email'], @placeholder=Email"),
+            vec![21]
+        );
+        assert_eq!(
+            find_pierced_backend_node_ids(&doc, "#missing, text:Verify you are human"),
+            vec![20]
+        );
     }
 }

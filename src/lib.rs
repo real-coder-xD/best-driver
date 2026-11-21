@@ -244,7 +244,7 @@ async fn arm_target_once(
 pub struct BrowserCore {
     process: Mutex<Option<BrowserProcess>>,
     conn: Arc<CdpConnection>,
-    tabs: Mutex<HashMap<String, Arc<Tab>>>,
+    tabs: Arc<Mutex<HashMap<String, Arc<Tab>>>>,
     sessions_by_target: Arc<Mutex<HashMap<String, String>>>,
     armed_targets: ArmedMap,
     headless_ua: Option<Value>,
@@ -254,6 +254,33 @@ pub struct BrowserCore {
     port: u16,
     user_data_dir: String,
     ws_url: String,
+}
+
+fn evict_python_session(session_id: &str) {
+    Python::attach(|py| {
+        if let Ok(m) = py.import("best_driver.network") {
+            let _ = m.call_method1("_evict_session", (session_id,));
+        }
+    });
+}
+
+fn evict_python_context(context_id: &str) {
+    Python::attach(|py| {
+        if let Ok(m) = py.import("best_driver.network") {
+            let _ = m.call_method1("_evict_context", (context_id,));
+        }
+    });
+}
+
+fn evict_python_sessions(session_ids: &[String]) {
+    if session_ids.is_empty() {
+        return;
+    }
+    Python::attach(|py| {
+        if let Ok(m) = py.import("best_driver.network") {
+            let _ = m.call_method1("_evict_sessions", (session_ids.to_vec(),));
+        }
+    });
 }
 
 impl BrowserCore {
@@ -292,6 +319,7 @@ impl BrowserCore {
             Err(_) => None,
         };
 
+        let tabs: Arc<Mutex<HashMap<String, Arc<Tab>>>> = Arc::new(Mutex::new(HashMap::new()));
         let sessions_by_target: Arc<Mutex<HashMap<String, String>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let armed_targets: ArmedMap = Arc::new(Mutex::new(HashMap::new()));
@@ -299,6 +327,7 @@ impl BrowserCore {
         // Subscribe BEFORE enabling Target.setAutoAttach so no early child target event is missed
         let mut rx = conn.subscribe();
         let conn_sup = Arc::clone(&conn);
+        let tabs_sup = Arc::clone(&tabs);
         let sessions_sup = Arc::clone(&sessions_by_target);
         let armed_sup = Arc::clone(&armed_targets);
         let ua_sup = headless_ua.clone();
@@ -354,12 +383,13 @@ impl BrowserCore {
                     }
                     "Target.detachedFromTarget" => {
                         if let Some(sid) = ev.params.get("sessionId").and_then(|v| v.as_str()) {
-                            let mut map = sessions_sup.lock().await;
-                            map.retain(|_, v| v != sid);
+                            sessions_sup.lock().await.retain(|_, v| v != sid);
+                            tabs_sup.lock().await.retain(|_, t| t.session_id() != sid);
                         }
                     }
                     "Target.targetDestroyed" => {
                         if let Some(tid) = ev.params.get("targetId").and_then(|v| v.as_str()) {
+                            tabs_sup.lock().await.remove(tid);
                             sessions_sup.lock().await.remove(tid);
                             armed_sup.lock().await.remove(tid);
                         }
@@ -384,7 +414,7 @@ impl BrowserCore {
         Ok(Self {
             process: Mutex::new(Some(proc)),
             conn,
-            tabs: Mutex::new(HashMap::new()),
+            tabs,
             sessions_by_target,
             armed_targets,
             headless_ua,
@@ -646,12 +676,25 @@ impl BrowserCore {
         }
     }
 
-    async fn stop(&self) {
+    async fn stop(&self) -> Vec<String> {
         if let Some(h) = self.auto_attach_task.lock().await.take() {
             h.abort();
         }
-        self.tabs.lock().await.clear();
-        self.sessions_by_target.lock().await.clear();
+        let mut sids: Vec<String> = {
+            let mut tabs = self.tabs.lock().await;
+            let list = tabs.values().map(|t| t.session_id().to_string()).collect();
+            tabs.clear();
+            list
+        };
+        {
+            let mut sessions = self.sessions_by_target.lock().await;
+            for sid in sessions.values() {
+                if !sids.contains(sid) {
+                    sids.push(sid.clone());
+                }
+            }
+            sessions.clear();
+        }
         self.armed_targets.lock().await.clear();
         // Ask Chromium to close gracefully first so persistent profiles flush SQLite/Cookies cleanly
         let _ = tokio::time::timeout(
@@ -662,6 +705,7 @@ impl BrowserCore {
         if let Some(mut proc) = self.process.lock().await.take() {
             proc.wait_graceful_or_kill(std::time::Duration::from_millis(1500));
         }
+        sids
     }
 }
 
@@ -1067,7 +1111,13 @@ impl PyTab {
     }
 
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |t| t.close().await)
+        let t = Arc::clone(&self.inner);
+        let sid = self.inner.session_id().to_string();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let res = t.close().await;
+            evict_python_session(&sid);
+            res.map_err(rt)
+        })
     }
 
     // reading
@@ -1882,7 +1932,9 @@ impl PyBrowserContext {
         let b = Arc::clone(&self.browser);
         let cid = self.context_id.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            b.dispose_context(&cid).await.map_err(rt)
+            let res = b.dispose_context(&cid).await;
+            evict_python_context(&cid);
+            res.map_err(rt)
         })
     }
 
@@ -1901,6 +1953,7 @@ impl PyBrowserContext {
         let cid = self.context_id.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let _ = b.dispose_context(&cid).await;
+            evict_python_context(&cid);
             Ok::<bool, PyErr>(false)
         })
     }
@@ -2059,9 +2112,11 @@ impl PyBrowser {
     }
 
     fn stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |c| {
-            c.stop().await;
-            Ok::<(), DriverError>(())
+        let c = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sids = c.stop().await;
+            evict_python_sessions(&sids);
+            Ok::<(), PyErr>(())
         })
     }
 
@@ -2076,9 +2131,11 @@ impl PyBrowser {
         py: Python<'py>,
         _args: &Bound<'py, pyo3::types::PyTuple>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |c| {
-            c.stop().await;
-            Ok::<bool, DriverError>(false)
+        let c = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let sids = c.stop().await;
+            evict_python_sessions(&sids);
+            Ok::<bool, PyErr>(false)
         })
     }
 }

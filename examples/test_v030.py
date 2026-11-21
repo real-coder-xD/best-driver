@@ -16,12 +16,18 @@ import best_driver
 
 FORM_HTML = """<!DOCTYPE html>
 <html>
-<head><title>v0.3.0 Locator & Form Test</title></head>
+<head><title>v0.3.1 Locator & Form Test</title></head>
 <body>
   <div id="cards">
     <div class="card"><span>Free Plan</span><button class="buy">Choose</button></div>
     <div class="card"><span>Pro Plan</span><button class="buy" onclick="window.__picked='pro'">Choose</button></div>
   </div>
+  <div id="form-wrap">
+    <input id="email-box" type="text" placeholder="Email" />
+    <button id="ok-btn">Sign In</button>
+    <p id="comma-txt">Hello, world</p>
+  </div>
+  <div id="closed-host"></div>
   <div id="delayed" style="display:none; width:100px; height:30px;">Ready Now</div>
   <input id="agree" type="checkbox" />
   <button id="disabled-btn" disabled>Locked</button>
@@ -31,6 +37,8 @@ FORM_HTML = """<!DOCTYPE html>
   </select>
   <script>
     setTimeout(() => { document.getElementById('delayed').style.display = 'block'; }, 250);
+    const sr = document.getElementById('closed-host').attachShadow({ mode: 'closed' });
+    sr.innerHTML = '<input id="closed-em" type="text" placeholder="ClosedEmail" />';
   </script>
 </body>
 </html>
@@ -170,7 +178,68 @@ async def main() -> None:
             assert await tier.value() == "pro"
             print("[PASS] SUITE 4: Locator.filter, wait_for(visible), is_enabled, check/uncheck, select_option verified!")
 
-        print("\n>>> ALL V0.3.0 AUDIT TESTS PASSED (100%) <<<")
+            # ── SUITE 5: v0.3.1 Zero-Leak Cleanup + Mixed Comma Smart Locators ──
+            print("\n--- SUITE 5: Zero-Leak Controller/HAR Cleanup & Mixed Comma Smart Locators ---")
+            import time
+            from best_driver.network import _CONTROLLERS, _HAR_RECORDERS
+
+            # 5A.1: Direct tab.close() without unroute()/stop_har()
+            t_leak = await browser.new_tab("about:blank")
+            sid_leak = t_leak.session_id
+            await t_leak.route("**/*", lambda r: r.continue_())
+            await t_leak.record_har(include_bodies=False)
+            assert sid_leak in _CONTROLLERS and sid_leak in _HAR_RECORDERS
+            await t_leak.close()
+            # Zero-tick check immediately after await close()
+            assert sid_leak not in _CONTROLLERS, f"Leaked route controller for {sid_leak}"
+            assert sid_leak not in _HAR_RECORDERS, f"Leaked HAR recorder for {sid_leak}"
+
+            # 5A.2: BrowserContext __aexit__ without closing tab or unroute()/stop_har()
+            async with await browser.new_context() as ctx_leak:
+                t_ctx = await ctx_leak.new_tab("about:blank")
+                sid_ctx = t_ctx.session_id
+                await t_ctx.route("**/*", lambda r: r.continue_())
+                await t_ctx.record_har(include_bodies=False)
+                assert sid_ctx in _CONTROLLERS and sid_ctx in _HAR_RECORDERS
+            assert sid_ctx not in _CONTROLLERS, f"Leaked ctx route controller for {sid_ctx}"
+            assert sid_ctx not in _HAR_RECORDERS, f"Leaked ctx HAR recorder for {sid_ctx}"
+
+            # 5A.3: EventStream auto-terminates via Target.detachedFromTarget on tab close
+            t_ev = await browser.new_tab("about:blank")
+            stream = t_ev.listen_requests()
+            t0 = time.monotonic()
+            async def close_soon() -> None:
+                await asyncio.sleep(0.1)
+                await t_ev.close()
+            closer = asyncio.create_task(close_soon())
+            ev = await stream.next(timeout_ms=3000)
+            elapsed = time.monotonic() - t0
+            await closer
+            assert ev is None and elapsed < 1.5, f"Stream did not close on detach (ev={ev}, dt={elapsed:.2f}s)"
+            print(f"  [CLEANUP] tab.close=0-tick clean, ctx.close=0-tick clean, detach stream EOF in {elapsed*1000:.0f}ms")
+
+            # 5B: Mixed comma Smart Locators (CSS + @attr + text: + XPath + child + closed shadow DOM)
+            el_css_attr = await tab.ele("input[type='email'], @placeholder=Email")
+            assert el_css_attr is not None and el_css_attr.id == "email-box"
+            loc_css_attr = await tab.locator("input[type='email'], @placeholder=Email").element()
+            assert loc_css_attr is not None and loc_css_attr.id == "email-box"
+            el_mix_txt = await tab.ele("#does-not-exist, text:Sign In")
+            assert el_mix_txt is not None and el_mix_txt.id == "ok-btn"
+            el_mix_xp = await tab.ele("#does-not-exist, //button[@id='ok-btn']")
+            assert el_mix_xp is not None and el_mix_xp.id == "ok-btn"
+            multi = await tab.eles("#email-box, text:Sign In")
+            multi_ids = [e.id for e in multi]
+            assert "email-box" in multi_ids and "ok-btn" in multi_ids
+            child_el = await tab.locator("#form-wrap").locator("input[type='email'], @placeholder=Email").element()
+            assert child_el is not None and child_el.id == "email-box"
+            closed_el = await tab.ele("input[type='email'], @placeholder=ClosedEmail")
+            assert closed_el is not None and closed_el.id == "closed-em"
+            comma_txt = await tab.ele("text:Hello, world")
+            assert comma_txt is not None and comma_txt.id == "comma-txt"
+            print("  [LOCATOR] CSS+@attr, CSS+text:, CSS+XPath, eles union, child, closed shadow, literal text comma all matched")
+            print("[PASS] SUITE 5: Zero-leak cleanup & mixed comma Smart Locators verified!")
+
+        print("\n>>> ALL V0.3.1 AUDIT TESTS PASSED (100%) <<<")
     finally:
         for p in (html_path, har_path):
             if os.path.exists(p):

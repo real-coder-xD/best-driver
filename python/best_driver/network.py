@@ -272,33 +272,40 @@ class _RouteController:
 
     async def _loop(self) -> None:
         assert self._stream is not None
-        while True:
-            ev = await self._stream.next()
-            if not ev:
-                break
-            method = ev.get("method")
-            params = ev.get("params") or {}
-            if method == "Fetch.requestPaused":
-                asyncio.create_task(self._dispatch_pause(params))
-            elif method == "Fetch.authRequired":
-                rid = params.get("requestId")
-                if not rid:
-                    continue
-                is_proxy = (params.get("authChallenge") or {}).get("source") == "Proxy"
-                if is_proxy and self._proxy_creds is not None:
-                    resp = {
-                        "response": "ProvideCredentials",
-                        "username": self._proxy_creds[0],
-                        "password": self._proxy_creds[1],
-                    }
-                else:
-                    resp = {"response": "Default"}
-                asyncio.create_task(
-                    self.tab.send(
-                        "Fetch.continueWithAuth",
-                        {"requestId": rid, "authChallengeResponse": resp},
+        sid = self.tab.session_id
+        try:
+            while True:
+                ev = await self._stream.next()
+                if not ev:
+                    break
+                method = ev.get("method")
+                params = ev.get("params") or {}
+                if method == "Fetch.requestPaused":
+                    asyncio.create_task(self._dispatch_pause(params))
+                elif method == "Fetch.authRequired":
+                    rid = params.get("requestId")
+                    if not rid:
+                        continue
+                    is_proxy = (params.get("authChallenge") or {}).get("source") == "Proxy"
+                    if is_proxy and self._proxy_creds is not None:
+                        resp = {
+                            "response": "ProvideCredentials",
+                            "username": self._proxy_creds[0],
+                            "password": self._proxy_creds[1],
+                        }
+                    else:
+                        resp = {"response": "Default"}
+                    asyncio.create_task(
+                        self.tab.send(
+                            "Fetch.continueWithAuth",
+                            {"requestId": rid, "authChallengeResponse": resp},
+                        )
                     )
-                )
+        finally:
+            if self._stream is not None:
+                self._stream.close()
+            if _CONTROLLERS.get(sid) is self:
+                _CONTROLLERS.pop(sid, None)
 
 
 _CONTROLLERS: Dict[str, _RouteController] = {}
@@ -529,106 +536,164 @@ class HarRecorder:
             self._task = None
 
     async def _loop(self) -> None:
-        while True:
-            ev = await self._stream.next()
-            if not ev:
-                break
-            method = ev.get("method")
-            params = ev.get("params") or {}
-            rid = str(params.get("requestId", ""))
-            if not rid:
-                continue
-            if method == "Network.requestWillBeSent":
-                req = params.get("request") or {}
-                self._pending[rid] = {
-                    "started": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                    "t0": float(params.get("timestamp") or 0.0),
-                    "method": str(req.get("method", "GET")),
-                    "url": str(req.get("url", "")),
-                    "req_headers": [
+        sid = self._tab.session_id
+        try:
+            while True:
+                ev = await self._stream.next()
+                if not ev:
+                    break
+                method = ev.get("method")
+                params = ev.get("params") or {}
+                rid = str(params.get("requestId", ""))
+                if not rid:
+                    continue
+                if method == "Network.requestWillBeSent":
+                    req = params.get("request") or {}
+                    self._pending[rid] = {
+                        "started": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                        "t0": float(params.get("timestamp") or 0.0),
+                        "method": str(req.get("method", "GET")),
+                        "url": str(req.get("url", "")),
+                        "req_headers": [
+                            {"name": str(k), "value": str(v)}
+                            for k, v in (req.get("headers") or {}).items()
+                        ],
+                        "post_data": req.get("postData"),
+                    }
+                elif method == "Network.responseReceived":
+                    rec = self._pending.get(rid)
+                    if rec is None:
+                        continue
+                    resp = params.get("response") or {}
+                    rec["status"] = int(resp.get("status") or 0)
+                    rec["status_text"] = str(resp.get("statusText", ""))
+                    rec["protocol"] = str(resp.get("protocol", "HTTP/1.1"))
+                    rec["mime_type"] = str(resp.get("mimeType", ""))
+                    rec["remote_ip"] = str(resp.get("remoteIPAddress", ""))
+                    rec["resp_headers"] = [
                         {"name": str(k), "value": str(v)}
-                        for k, v in (req.get("headers") or {}).items()
-                    ],
-                    "post_data": req.get("postData"),
-                }
-            elif method == "Network.responseReceived":
-                rec = self._pending.get(rid)
-                if rec is None:
-                    continue
-                resp = params.get("response") or {}
-                rec["status"] = int(resp.get("status") or 0)
-                rec["status_text"] = str(resp.get("statusText", ""))
-                rec["protocol"] = str(resp.get("protocol", "HTTP/1.1"))
-                rec["mime_type"] = str(resp.get("mimeType", ""))
-                rec["remote_ip"] = str(resp.get("remoteIPAddress", ""))
-                rec["resp_headers"] = [
-                    {"name": str(k), "value": str(v)}
-                    for k, v in (resp.get("headers") or {}).items()
-                ]
-            elif method == "Network.loadingFinished":
-                rec = self._pending.pop(rid, None)
-                if rec is None:
-                    continue
-                t1 = float(params.get("timestamp") or rec["t0"])
-                elapsed_ms = max(0.0, round((t1 - rec["t0"]) * 1000.0, 2))
-                body_text = ""
-                body_encoding = None
-                if self._include_bodies:
-                    try:
-                        res = await self._tab.send("Network.getResponseBody", {"requestId": rid})
-                        body_text = str(res.get("body") or "")
-                        if res.get("base64Encoded"):
-                            body_encoding = "base64"
-                    except Exception:
-                        pass
-                content: Dict[str, Any] = {
-                    "size": int(params.get("encodedDataLength") or len(body_text)),
-                    "mimeType": rec.get("mime_type", ""),
-                    "text": body_text,
-                }
-                if body_encoding:
-                    content["encoding"] = body_encoding
-                entry: Dict[str, Any] = {
-                    "startedDateTime": rec["started"],
-                    "time": elapsed_ms,
-                    "serverIPAddress": rec.get("remote_ip", ""),
-                    "request": {
-                        "method": rec["method"],
-                        "url": rec["url"],
-                        "httpVersion": rec.get("protocol", "HTTP/1.1"),
-                        "headers": rec["req_headers"],
-                        "cookies": [],
-                        "queryString": [],
-                        "headersSize": -1,
-                        "bodySize": len(rec["post_data"]) if rec.get("post_data") else 0,
-                    },
-                    "response": {
-                        "status": rec.get("status", 0),
-                        "statusText": rec.get("status_text", ""),
-                        "httpVersion": rec.get("protocol", "HTTP/1.1"),
-                        "headers": rec.get("resp_headers", []),
-                        "cookies": [],
-                        "content": content,
-                        "redirectURL": "",
-                        "headersSize": -1,
-                        "bodySize": int(params.get("encodedDataLength") or 0),
-                    },
-                    "cache": {},
-                    "timings": {"send": 0, "wait": elapsed_ms, "receive": 0},
-                }
-                self.entries.append(entry)
+                        for k, v in (resp.get("headers") or {}).items()
+                    ]
+                elif method == "Network.loadingFinished":
+                    rec = self._pending.pop(rid, None)
+                    if rec is None:
+                        continue
+                    t1 = float(params.get("timestamp") or rec["t0"])
+                    elapsed_ms = max(0.0, round((t1 - rec["t0"]) * 1000.0, 2))
+                    body_text = ""
+                    body_encoding = None
+                    if self._include_bodies:
+                        try:
+                            res = await self._tab.send("Network.getResponseBody", {"requestId": rid})
+                            body_text = str(res.get("body") or "")
+                            if res.get("base64Encoded"):
+                                body_encoding = "base64"
+                        except Exception:
+                            pass
+                    content: Dict[str, Any] = {
+                        "size": int(params.get("encodedDataLength") or len(body_text)),
+                        "mimeType": rec.get("mime_type", ""),
+                        "text": body_text,
+                    }
+                    if body_encoding:
+                        content["encoding"] = body_encoding
+                    entry: Dict[str, Any] = {
+                        "startedDateTime": rec["started"],
+                        "time": elapsed_ms,
+                        "serverIPAddress": rec.get("remote_ip", ""),
+                        "request": {
+                            "method": rec["method"],
+                            "url": rec["url"],
+                            "httpVersion": rec.get("protocol", "HTTP/1.1"),
+                            "headers": rec["req_headers"],
+                            "cookies": [],
+                            "queryString": [],
+                            "headersSize": -1,
+                            "bodySize": len(rec["post_data"]) if rec.get("post_data") else 0,
+                        },
+                        "response": {
+                            "status": rec.get("status", 0),
+                            "statusText": rec.get("status_text", ""),
+                            "httpVersion": rec.get("protocol", "HTTP/1.1"),
+                            "headers": rec.get("resp_headers", []),
+                            "cookies": [],
+                            "content": content,
+                            "redirectURL": "",
+                            "headersSize": -1,
+                            "bodySize": int(params.get("encodedDataLength") or 0),
+                        },
+                        "cache": {},
+                        "timings": {"send": 0, "wait": elapsed_ms, "receive": 0},
+                    }
+                    self.entries.append(entry)
+        finally:
+            self._stream.close()
+            if _HAR_RECORDERS.get(sid) is self:
+                _HAR_RECORDERS.pop(sid, None)
 
     def to_har(self) -> Dict[str, Any]:
         return {
             "log": {
                 "version": "1.2",
-                "creator": {"name": "best-driver", "version": "0.3.0"},
+                "creator": {"name": "best-driver", "version": "0.3.1"},
                 "entries": list(self.entries),
             }
         }
 
 
 _HAR_RECORDERS: Dict[str, HarRecorder] = {}
+
+
+def _cancel_task_safe(task: Optional[asyncio.Task[Any]]) -> None:
+    if task is None or task.done():
+        return
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    loop = task.get_loop()
+    if running is loop:
+        task.cancel()
+    elif not loop.is_closed():
+        loop.call_soon_threadsafe(task.cancel)
+
+
+def _evict_session(session_id: str) -> None:
+    """Synchronously detach route/HAR controllers for a closed tab session (thread-safe)."""
+    ctrl = _CONTROLLERS.pop(session_id, None)
+    if ctrl is not None:
+        if ctrl._stream is not None:
+            ctrl._stream.close()
+        _cancel_task_safe(ctrl._task)
+        ctrl._task = None
+        ctrl._stream = None
+    rec = _HAR_RECORDERS.pop(session_id, None)
+    if rec is not None:
+        rec._stream.close()
+        _cancel_task_safe(rec._task)
+        rec._task = None
+
+
+def _evict_context(context_id: str) -> None:
+    """Synchronously detach route/HAR controllers for every tab inside `context_id`."""
+    sids = {
+        k
+        for k, v in list(_CONTROLLERS.items())
+        if getattr(v.tab, "context_id", None) == context_id
+    }
+    sids.update(
+        k
+        for k, v in list(_HAR_RECORDERS.items())
+        if getattr(v._tab, "context_id", None) == context_id
+    )
+    for sid in sids:
+        _evict_session(sid)
+
+
+def _evict_sessions(session_ids: Any) -> None:
+    """Synchronously detach route/HAR controllers for a batch of closed tab sessions."""
+    for sid in session_ids:
+        _evict_session(str(sid))
 
 
 async def start_har(tab: Any, include_bodies: bool = True) -> HarRecorder:
@@ -649,7 +714,7 @@ async def export_har(tab: Any, path: Optional[str] = None) -> Dict[str, Any]:
     har = (
         rec.to_har()
         if rec is not None
-        else {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.0"}, "entries": []}}
+        else {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.1"}, "entries": []}}
     )
     if path is not None:
         with open(path, "w", encoding="utf-8") as fh:
@@ -661,7 +726,7 @@ async def stop_har(tab: Any) -> Dict[str, Any]:
     """Stop HAR 1.2 recording on `tab` and return the captured HAR dictionary."""
     rec = _HAR_RECORDERS.pop(tab.session_id, None)
     if rec is None:
-        return {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.0"}, "entries": []}}
+        return {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.1"}, "entries": []}}
     await rec.stop()
     return rec.to_har()
 

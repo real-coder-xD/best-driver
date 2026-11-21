@@ -2,6 +2,16 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.3.1] - 2026-11-21
+
+### Fixed
+- **Zero-Leak Tab & Context Lifecycle Cleanup (`_CONTROLLERS`, `_HAR_RECORDERS`, `EventStream`, `BrowserCore`)**:
+  - `SessionEventRx::recv()` now detects CDP `Target.detachedFromTarget` for its `sessionId` and closes the stream immediately, automatically terminating `_RouteController`, `HarRecorder`, `RequestStream`, and `ResponseStream` tasks even when tabs are closed via `tab.close()`, `ctx.close()`, or JS `window.close()` without calling `unroute()` / `stop_har()`.
+  - Added `try ... finally` self-cleanup in `_RouteController._loop()` and `HarRecorder._loop()`, plus thread-safe synchronous eviction on `tab.close()`, `ctx.close()` / `__aexit__`, and `browser.stop()` / `__aexit__` so `_CONTROLLERS` and `_HAR_RECORDERS` are cleared immediately with zero event-loop tick lag.
+  - `BrowserCore` now removes closed targets from `tabs` on `Target.detachedFromTarget` / `Target.targetDestroyed`, and `Tab::close()` immediately aborts background `dialog_task` / `auth_task` handles.
+- **Mixed Comma Smart Locators (`"input[type='email'], @placeholder=Email"`)**:
+  - Added top-level quote/bracket/paren-aware `split_locator_branches()` in `src/locator.rs` so comma-separated mixed Smart Locators (combining CSS, `@attr=val`, `text:`/`t:`, and XPath) work seamlessly across `tab.ele()`, `tab.eles()`, `tab.locator()`, `el.ele()`, `el.eles()`, and closed `#shadow-root` traversal while preserving commas inside quotes, `:is(...)`, XPath predicates, and plain `text:Hello, world` queries.
+
 ## [0.3.0] - 2026-11-21
 
 ### Fixed

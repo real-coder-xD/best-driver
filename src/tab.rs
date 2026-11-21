@@ -225,6 +225,13 @@ impl Tab {
     }
 
     pub async fn close(&self) -> DriverResult<()> {
+        for slot in [&self.dialog_task, &self.auth_task] {
+            if let Ok(mut g) = slot.lock() {
+                if let Some(h) = g.take() {
+                    h.abort();
+                }
+            }
+        }
         self.cdp
             .call_browser("Target.closeTarget", json!({ "targetId": self.target_id }))
             .await

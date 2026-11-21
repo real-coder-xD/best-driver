@@ -1,4 +1,4 @@
-from .best_driver import Browser, BrowserContext, Element, EventStream, Tab, start
+from .best_driver import Browser, BrowserContext, Element, EventStream, Tab, start # type: ignore
 from .locator import Locator
 from .network import (
     HarRecorder,

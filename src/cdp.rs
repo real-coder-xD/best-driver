@@ -181,6 +181,14 @@ impl SessionEventRx {
                     if ev.session_id.as_deref() == Some(self.session_id.as_str()) {
                         return Ok((ev.method, ev.params));
                     }
+                    // Terminate session streams immediately when their CDP target detaches
+                    // (tab.close(), ctx.close(), or JS window.close()).
+                    if ev.method == "Target.detachedFromTarget"
+                        && ev.params.get("sessionId").and_then(|v| v.as_str())
+                            == Some(self.session_id.as_str())
+                    {
+                        return Err(broadcast::error::RecvError::Closed);
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(e) => return Err(e),
