@@ -1,4 +1,5 @@
-from .best_driver import Browser, BrowserContext, Element, EventStream, Tab, start # type: ignore
+from .best_driver import Browser, BrowserContext, Element, EventStream, Tab, connect, start # type: ignore
+from .cleanup import CleanupReport, cleanup
 from .events import (
     ConsoleMessage,
     ConsoleStream,
@@ -23,6 +24,7 @@ from .tls import sync_from_tls, tls_session
 __all__ = [
     "Browser",
     "BrowserContext",
+    "CleanupReport",
     "ConsoleMessage",
     "ConsoleStream",
     "CrashEvent",
@@ -41,6 +43,8 @@ __all__ = [
     "StreamedRequest",
     "StreamedResponse",
     "Tab",
+    "cleanup",
+    "connect",
     "start",
     "sync_from_tls",
     "tls_session",

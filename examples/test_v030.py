@@ -309,7 +309,148 @@ async def main() -> None:
             await t_crash.close()
             print("[PASS] SUITE 6: Popups, opt-in console/page_errors (+ stealth restore), and crash detection verified!")
 
-        print("\n>>> ALL V0.3.2 AUDIT TESTS PASSED (100%) <<<")
+        # ── SUITE 7: v0.3.3 keep_open, detach(), connect(), wait_until_closed() ──
+        print("\n--- SUITE 7: keep_open=True, detach(), best_driver.connect(), wait_until_closed() ---")
+        import shutil
+
+        b_keep = await best_driver.start(headless=True, keep_open=True)
+        keep_port = b_keep.port
+        keep_profile = b_keep.user_data_dir
+        t_keep = await b_keep.get(form_url, wait_until="load")
+        assert await t_keep.title() == "v0.3.1 Locator & Form Test"
+        await b_keep.stop()  # keep_open=True -> leaves Chromium running!
+
+        # Reconnect by integer port to the exact running Chromium
+        b_conn1 = await best_driver.connect(keep_port)
+        assert await b_conn1.is_alive() is True
+        t_conn1 = await b_conn1.main_tab()
+        title1 = await t_conn1.title()
+        print(f"  [CONNECT port={keep_port}] re-attached title={title1!r}")
+        assert title1 == "v0.3.1 Locator & Form Test"
+        await b_conn1.stop()  # connect() handle is detached -> still leaves Chromium running!
+
+        # Reconnect by HTTP URL, test wait_until_closed() wakeup when Chrome shuts down
+        b_conn2 = await best_driver.connect(f"http://127.0.0.1:{keep_port}")
+        t_conn2 = await b_conn2.main_tab()
+        t0 = time.monotonic()
+
+        async def trigger_browser_close() -> None:
+            await asyncio.sleep(0.12)
+            try:
+                await t_conn2.send("Browser.close", {})
+            except Exception:
+                pass
+
+        closer_task = asyncio.create_task(trigger_browser_close())
+        await asyncio.wait_for(b_conn2.wait_until_closed(poll_ms=100), timeout=5.0)
+        dt_close = time.monotonic() - t0
+        await closer_task
+        assert await b_conn2.is_alive() is False
+        print(f"  [WAIT_UNTIL_CLOSED] woke up in {dt_close*1000:.0f}ms | is_alive={await b_conn2.is_alive()}")
+
+        # Clean up the preserved detached temp profile directory
+        await asyncio.sleep(0.3)
+        shutil.rmtree(keep_profile, ignore_errors=True)
+
+        # Also test explicit browser.detach() on a regular start() handle
+        b_det = await best_driver.start(headless=True)
+        det_port = b_det.port
+        det_profile = b_det.user_data_dir
+        b_det.detach()
+        await b_det.stop()
+        b_re = await best_driver.connect(det_port)
+        assert await b_re.is_alive() is True
+        t_re = await b_re.main_tab()
+        try:
+            await t_re.send("Browser.close", {})
+        except Exception:
+            pass
+        await asyncio.wait_for(b_re.wait_until_closed(poll_ms=100), timeout=5.0)
+        await asyncio.sleep(0.3)
+        shutil.rmtree(det_profile, ignore_errors=True)
+        print("[PASS] SUITE 7: keep_open=True, detach(), connect(port/http), and wait_until_closed() verified!")
+
+        # ── SUITE 8: Conflict-Safe best_driver.cleanup() ──
+        print("\n--- SUITE 8: best_driver.cleanup() Conflict-Safety & Stale Profile Removal ---")
+        import tempfile
+
+        fake_stale = tempfile.mkdtemp(prefix="best_driver_profile_stale_test_")
+        with open(os.path.join(fake_stale, "dummy.bin"), "wb") as df:
+            df.write(b"x" * 4096)
+
+        async with await best_driver.start(headless=True) as b_active:
+            active_dir = b_active.user_data_dir
+
+            # 8A: dry_run=True reports stale dir, skips active browser, deletes nothing
+            rep_dry = best_driver.cleanup(dry_run=True)
+            assert any(os.path.samefile(p, fake_stale) for p in rep_dry["removed_dirs"])
+            assert any(os.path.samefile(p, active_dir) for p in rep_dry["skipped_in_use"])
+            assert os.path.exists(fake_stale)
+
+            # 8B: cleanup(kill_orphans=True) MUST NOT touch b_active (live parent PID!) and MUST delete fake_stale
+            rep_run = best_driver.cleanup(kill_orphans=True)
+            assert not os.path.exists(fake_stale), "Stale profile dir was not removed"
+            assert await b_active.is_alive() is True, "Active browser was wrongly killed!"
+            assert any(os.path.samefile(p, active_dir) for p in rep_run["skipped_in_use"])
+            assert os.path.exists(active_dir)
+            print(f"  [CLEANUP] removed={len(rep_run['removed_dirs'])} freed={rep_run['freed_bytes']}B skipped_in_use={len(rep_run['skipped_in_use'])} active_alive={await b_active.is_alive()}")
+
+        print("[PASS] SUITE 8: best_driver.cleanup() removed stale profiles while protecting active Chromium 100%!")
+
+        # ── SUITE 9: Key Chords, load_storage_state(), grant_permissions(), Window Bounds ──
+        print("\n--- SUITE 9: Key Chords, load_storage_state(), grant_permissions(), Window Bounds ---")
+        state_path = os.path.abspath("tmp_state_v033.json")
+        try:
+            async with await best_driver.start(headless=True) as b9:
+                # 9A: Modifier key chords (`Control+a` + `Backspace`) on an input
+                t9 = await b9.get(form_url, wait_until="load")
+                await t9.evaluate("""(() => {
+                    window.__chords = [];
+                    const inp = document.getElementById('email-box');
+                    inp.value = 'old_value_to_replace';
+                    inp.addEventListener('keydown', e => window.__chords.push({ k: e.key, ctrl: e.ctrlKey, shift: e.shiftKey }));
+                })()""")
+                await t9.focus("#email-box")
+                await t9.press_key("Control+a")
+                await t9.press_key("Backspace")
+                await t9.type_text("fresh@example.com", delay_ms=10)
+                val_after = await t9.value("#email-box")
+                chords = await t9.evaluate("window.__chords")
+                assert val_after == "fresh@example.com", f"Control+a + Backspace failed: {val_after!r}"
+                assert any(c.get("ctrl") is True and c.get("k", "").lower() == "a" for c in chords)
+
+                # 9B: grant_permissions() on HTTP origin
+                await t9.get("https://httpbin.org/html", wait_until="load")
+                await t9.grant_permissions(["notifications", "clipboard-read"])
+                perm_state = await t9.evaluate("navigator.permissions.query({ name: 'notifications' }).then(p => p.state)")
+                assert perm_state == "granted", f"Expected notifications granted, got {perm_state!r}"
+
+                # 9C: storage_state() (cookies + localStorage) -> load_storage_state() in a fresh BrowserContext
+                await t9.set_cookie("st_tok", "persisted_777", domain="httpbin.org")
+                await t9.storage_set("theme", "dark_v033")
+                st_out = await t9.storage_state(state_path)
+                assert any(o.get("origin") == "https://httpbin.org" for o in st_out.get("origins", []))
+
+                async with await b9.new_context() as ctx_restore:
+                    t_r = await ctx_restore.get("https://httpbin.org/html", wait_until="load")
+                    assert await t_r.storage_get("theme") is None
+                    loaded = await t_r.load_storage_state(state_path)
+                    assert loaded["cookies"] >= 1 and loaded["local_storage"] >= 1
+                    assert await t_r.storage_get("theme") == "dark_v033"
+                    c_restored = await t_r.cookies()
+                    assert any(c["name"] == "st_tok" and c["value"] == "persisted_777" for c in c_restored)
+
+                # 9D: get_window_bounds() & set_window_bounds()
+                await t9.set_window_bounds(width=1024, height=768)
+                wb = await t9.get_window_bounds()
+                print(f"  [UTILS] chord_val={val_after!r} notif={perm_state} loaded={loaded} window={wb['width']}x{wb['height']} ({wb['state']})")
+                assert wb["width"] == 1024 and wb["height"] == 768
+            print("[PASS] SUITE 9: Key chords, grant_permissions, load_storage_state, and window bounds verified!")
+        finally:
+            if os.path.exists(state_path):
+                os.remove(state_path)
+
+        print("\n>>> ALL V0.3.3 AUDIT TESTS PASSED (100%) <<<")
     finally:
         for p in (html_path, har_path):
             if os.path.exists(p):

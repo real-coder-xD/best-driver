@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 use crate::browser::derive_tls_preset;
 use crate::cdp::{CdpSession, SessionEventRx};
 use crate::error::{DriverError, DriverResult};
-use crate::input::{bezier_trajectory, jitter, key_def, swipe_trajectory};
+use crate::input::{bezier_trajectory, jitter, parse_key_chord, swipe_trajectory};
 use crate::locator::{
     child_sel_all_fn, child_sel_fn, find_pierced_backend_node_ids, js_str, sel_all_expr, sel_expr,
     NODE_META_FN,
@@ -20,6 +20,7 @@ pub const EVASION_JS: &str = include_str!("evasion.js");
 pub struct Tab {
     pub target_id: String,
     pub cdp: Arc<CdpSession>,
+    rt: tokio::runtime::Handle,
     proxy: Option<String>,
     browser_context_id: Option<String>,
     frame_chain: Vec<String>,
@@ -57,6 +58,7 @@ impl Tab {
         Ok(Self {
             target_id,
             cdp,
+            rt: tokio::runtime::Handle::current(),
             proxy,
             browser_context_id,
             frame_chain: Vec::new(),
@@ -225,6 +227,11 @@ impl Tab {
     }
 
     pub async fn close(&self) -> DriverResult<()> {
+        if !self.frame_chain.is_empty() {
+            return Err(DriverError::InvalidInput(
+                "Không thể gọi close() trên handle in-process iframe; hãy đóng tab chứa iframe".to_string(),
+            ));
+        }
         for slot in [&self.dialog_task, &self.auth_task] {
             if let Ok(mut g) = slot.lock() {
                 if let Some(h) = g.take() {
@@ -344,9 +351,33 @@ impl Tab {
             "{}.map(e => (e.innerText ?? e.textContent ?? '').trim())",
             sel_all_expr(selector)
         )).await?;
-        Ok(v.as_array()
+        let list: Vec<String> = v
+            .as_array()
             .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        if !list.is_empty() {
+            return Ok(list);
+        }
+        let ids = self.pierce_find_ids(selector).await.unwrap_or_default();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let futs: Vec<_> = ids
+            .into_iter()
+            .map(|nid| {
+                self.call_on_node(
+                    nid,
+                    "function() { return (this.innerText ?? this.textContent ?? '').trim(); }",
+                    vec![],
+                )
+            })
+            .collect();
+        Ok(futures_util::future::join_all(futs)
+            .await
+            .into_iter()
+            .flatten()
+            .filter_map(|val| val.as_str().map(str::to_string))
+            .collect())
     }
 
     pub async fn attr(&self, selector: &str, name: &str) -> DriverResult<Option<String>> {
@@ -355,7 +386,13 @@ impl Tab {
             sel_expr(selector),
             js_str(name)
         )).await?;
-        Ok(v.as_str().map(str::to_string))
+        if let Some(s) = v.as_str() {
+            return Ok(Some(s.to_string()));
+        }
+        if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+            return self.attr_node(nid, name).await;
+        }
+        Ok(None)
     }
 
     pub async fn attr_all(&self, selector: &str, name: &str) -> DriverResult<Vec<Option<String>>> {
@@ -364,9 +401,23 @@ impl Tab {
             sel_all_expr(selector),
             js_str(name)
         )).await?;
-        Ok(v.as_array()
+        let list: Vec<Option<String>> = v
+            .as_array()
             .map(|a| a.iter().map(|x| x.as_str().map(str::to_string)).collect())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        if !list.is_empty() {
+            return Ok(list);
+        }
+        let ids = self.pierce_find_ids(selector).await.unwrap_or_default();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let futs: Vec<_> = ids.into_iter().map(|nid| self.attr_node(nid, name)).collect();
+        Ok(futures_util::future::join_all(futs)
+            .await
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     pub async fn value(&self, selector: &str) -> DriverResult<Option<String>> {
@@ -374,7 +425,18 @@ impl Tab {
             "(() => {{ const el = {}; return el && 'value' in el ? String(el.value) : null; }})()",
             sel_expr(selector)
         )).await?;
-        Ok(v.as_str().map(str::to_string))
+        if let Some(s) = v.as_str() {
+            return Ok(Some(s.to_string()));
+        }
+        if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+            let val = self.call_on_node(
+                nid,
+                "function() { return 'value' in this ? String(this.value) : null; }",
+                vec![],
+            ).await?;
+            return Ok(val.as_str().map(str::to_string));
+        }
+        Ok(None)
     }
 
     pub async fn inner_html(&self, selector: &str) -> DriverResult<Option<String>> {
@@ -382,7 +444,13 @@ impl Tab {
             "(() => {{ const el = {}; return el ? el.innerHTML : null; }})()",
             sel_expr(selector)
         )).await?;
-        Ok(v.as_str().map(str::to_string))
+        if let Some(s) = v.as_str() {
+            return Ok(Some(s.to_string()));
+        }
+        if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+            return self.inner_html_node(nid).await;
+        }
+        Ok(None)
     }
 
     // ───────────────────────────── Waiting ─────────────────────────────
@@ -427,10 +495,31 @@ impl Tab {
         } else {
             format!("{} !== null", sel_expr(selector))
         };
-        self.wait_for_function(&expr, timeout_ms, 100)
-            .await
-            .map(|_| ())
-            .map_err(|_| DriverError::Timeout(format!("Chờ phần tử '{}' quá {}ms", selector, timeout_ms)))
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if self.evaluate(&expr).await.ok() == Some(Value::Bool(true)) {
+                return Ok(());
+            }
+            if let Ok(ids) = self.pierce_find_ids(selector).await {
+                if !ids.is_empty() {
+                    if !visible {
+                        return Ok(());
+                    }
+                    for nid in ids {
+                        if self.is_visible_node(nid).await.unwrap_or(false) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(DriverError::Timeout(format!(
+                    "Chờ phần tử '{}' quá {}ms",
+                    selector, timeout_ms
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     pub async fn wait_for_hidden(&self, selector: &str, timeout_ms: u64) -> DriverResult<()> {
@@ -439,10 +528,30 @@ impl Tab {
              return s.visibility === 'hidden' || s.display === 'none' || el.getClientRects().length === 0; }})()",
             sel_expr(selector)
         );
-        self.wait_for_function(&expr, timeout_ms, 100)
-            .await
-            .map(|_| ())
-            .map_err(|_| DriverError::Timeout(format!("Chờ phần tử '{}' biến mất quá {}ms", selector, timeout_ms)))
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if self.evaluate(&expr).await.ok() == Some(Value::Bool(true)) {
+                let mut pierced_visible = false;
+                if let Ok(ids) = self.pierce_find_ids(selector).await {
+                    for nid in ids {
+                        if self.is_visible_node(nid).await.unwrap_or(false) {
+                            pierced_visible = true;
+                            break;
+                        }
+                    }
+                }
+                if !pierced_visible {
+                    return Ok(());
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(DriverError::Timeout(format!(
+                    "Chờ phần tử '{}' biến mất quá {}ms",
+                    selector, timeout_ms
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     pub async fn wait_for_text(&self, text: &str, timeout_ms: u64) -> DriverResult<()> {
@@ -605,21 +714,35 @@ impl Tab {
         self.mouse_click(x, y, "left", 1).await
     }
 
+    async fn selector_center(&self, selector: &str) -> DriverResult<(f64, f64)> {
+        if let Ok(pos) = self.element_center(&sel_expr(selector), selector).await {
+            return Ok(pos);
+        }
+        if let Ok(ids) = self.pierce_find_ids(selector).await {
+            for nid in ids {
+                if let Ok(pos) = self.node_center(nid).await {
+                    return Ok(pos);
+                }
+            }
+        }
+        Err(DriverError::NotFound(selector.to_string()))
+    }
+
     pub async fn hover(&self, selector: &str, timeout_ms: u64) -> DriverResult<()> {
         self.wait_for_selector(selector, timeout_ms, true).await?;
-        let (x, y) = self.element_center(&sel_expr(selector), selector).await?;
+        let (x, y) = self.selector_center(selector).await?;
         self.mouse_move(x, y).await
     }
 
     pub async fn drag(&self, from_selector: &str, to_selector: &str, timeout_ms: u64) -> DriverResult<()> {
         self.wait_for_selector(from_selector, timeout_ms, true).await?;
         self.wait_for_selector(to_selector, timeout_ms, true).await?;
-        let (fx, fy) = self.element_center(&sel_expr(from_selector), from_selector).await?;
+        let (fx, fy) = self.selector_center(from_selector).await?;
         self.mouse_move(fx, fy).await?;
         self.cdp.call("Input.dispatchMouseEvent", json!({
             "type": "mousePressed", "button": "left", "clickCount": 1, "x": fx, "y": fy
         })).await?;
-        let (tx, ty) = self.element_center(&sel_expr(to_selector), to_selector).await?;
+        let (tx, ty) = self.selector_center(to_selector).await?;
         let steps = 15;
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
@@ -664,17 +787,39 @@ impl Tab {
 
     pub async fn focus(&self, selector: &str, timeout_ms: u64) -> DriverResult<()> {
         self.wait_for_selector(selector, timeout_ms, false).await?;
-        self.evaluate(&format!("{}.focus()", sel_expr(selector))).await.map(|_| ())
+        let ok = self
+            .evaluate(&format!(
+                "(() => {{ const el = {}; if (!el) return false; el.focus(); return true; }})()",
+                sel_expr(selector)
+            ))
+            .await?;
+        if ok == Value::Bool(true) {
+            return Ok(());
+        }
+        if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+            return self.focus_node(nid).await;
+        }
+        Err(DriverError::NotFound(selector.to_string()))
     }
 
     pub async fn clear(&self, selector: &str, timeout_ms: u64) -> DriverResult<()> {
-        self.focus(selector, timeout_ms).await?;
-        self.evaluate(&format!(
-            "(() => {{ const el = {}; if (el.select) el.select(); \
-             else {{ const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }} }})()",
-            sel_expr(selector)
-        )).await?;
-        self.press_key("Backspace").await
+        self.wait_for_selector(selector, timeout_ms, false).await?;
+        let ok = self
+            .evaluate(&format!(
+                "(() => {{ const el = {}; if (!el) return false; el.focus(); \
+                 if (el.select) el.select(); \
+                 else {{ const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); }} \
+                 return true; }})()",
+                sel_expr(selector)
+            ))
+            .await?;
+        if ok == Value::Bool(true) {
+            return self.press_key("Backspace").await;
+        }
+        if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+            return self.clear_node(nid).await;
+        }
+        Err(DriverError::NotFound(selector.to_string()))
     }
 
     pub async fn type_text(&self, text: &str, delay_ms: u64) -> DriverResult<()> {
@@ -744,25 +889,75 @@ impl Tab {
     }
 
     pub async fn press_key(&self, key: &str) -> DriverResult<()> {
-        let (k, code, vk, text) = key_def(key)
-            .ok_or_else(|| DriverError::InvalidInput(format!("Phím không hỗ trợ: {}", key)))?;
+        let chord = parse_key_chord(key)
+            .ok_or_else(|| DriverError::InvalidInput(format!("Phím hoặc tổ hợp phím không hỗ trợ: {}", key)))?;
+
+        // Hold modifier keys down in order (if any)
+        let mut active_mods = 0i64;
+        for &(mk, mc, mvk) in &chord.modifier_keys {
+            let bit = match mk {
+                "Alt" => 1,
+                "Control" => 2,
+                "Meta" => 4,
+                "Shift" => 8,
+                _ => 0,
+            };
+            active_mods |= bit;
+            self.cdp.call("Input.dispatchKeyEvent", json!({
+                "type": "rawKeyDown",
+                "modifiers": active_mods,
+                "key": mk,
+                "code": mc,
+                "windowsVirtualKeyCode": mvk
+            })).await?;
+        }
+
+        // Omit `nativeVirtualKeyCode` so Chromium Blink executes editing `commands` (copy/paste/cut) reliably
         let mut down = json!({
-            "type": if text.is_empty() { "rawKeyDown" } else { "keyDown" },
-            "key": k, "code": code,
-            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk
+            "type": if chord.text.is_empty() { "rawKeyDown" } else { "keyDown" },
+            "modifiers": chord.modifiers,
+            "key": chord.key,
+            "code": chord.code,
+            "windowsVirtualKeyCode": chord.vk
         });
-        if !text.is_empty() {
-            if let Some(map) = down.as_object_mut() {
-                map.insert("text".to_string(), json!(text));
-                map.insert("unmodifiedText".to_string(), json!(text));
+        if let Some(map) = down.as_object_mut() {
+            if !chord.text.is_empty() {
+                map.insert("text".to_string(), json!(chord.text));
+                map.insert("unmodifiedText".to_string(), json!(chord.text));
+            }
+            if !chord.commands.is_empty() {
+                map.insert("commands".to_string(), json!(chord.commands));
             }
         }
         self.cdp.call("Input.dispatchKeyEvent", down).await?;
-        tokio::time::sleep(jitter(30, 30)).await;
+        tokio::time::sleep(jitter(25, 25)).await;
         self.cdp.call("Input.dispatchKeyEvent", json!({
-            "type": "keyUp", "key": k, "code": code,
-            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk
-        })).await.map(|_| ())
+            "type": "keyUp",
+            "modifiers": chord.modifiers,
+            "key": chord.key,
+            "code": chord.code,
+            "windowsVirtualKeyCode": chord.vk
+        })).await?;
+
+        // Release held modifier keys in reverse order
+        for &(mk, mc, mvk) in chord.modifier_keys.iter().rev() {
+            let bit = match mk {
+                "Alt" => 1,
+                "Control" => 2,
+                "Meta" => 4,
+                "Shift" => 8,
+                _ => 0,
+            };
+            active_mods &= !bit;
+            let _ = self.cdp.call("Input.dispatchKeyEvent", json!({
+                "type": "keyUp",
+                "modifiers": active_mods,
+                "key": mk,
+                "code": mc,
+                "windowsVirtualKeyCode": mvk
+            })).await;
+        }
+        Ok(())
     }
 
     // ───────────────────── Native CDP Element Handles (Zero DOM Mutation) ─────────────────────
@@ -885,7 +1080,9 @@ impl Tab {
             backend_node_id,
             "function() { \
                 if (this.select) this.select(); \
-                else { const r = document.createRange(); r.selectNodeContents(this); const s = getSelection(); s.removeAllRanges(); s.addRange(r); } \
+                else { const doc = this.ownerDocument || document; const win = doc.defaultView || window; \
+                       const r = doc.createRange(); r.selectNodeContents(this); \
+                       const s = win.getSelection(); if (s) { s.removeAllRanges(); s.addRange(r); } } \
             }",
             vec![],
         ).await?;
@@ -996,6 +1193,7 @@ impl Tab {
     }
 
     pub async fn screenshot_node(&self, backend_node_id: i64, file_path: Option<String>) -> DriverResult<Vec<u8>> {
+        let (ox, oy) = self.frame_viewport_offset().await;
         let r = self.call_on_node(
             backend_node_id,
             "function() { \
@@ -1009,6 +1207,12 @@ impl Tab {
             .as_object()
             .cloned()
             .ok_or_else(|| DriverError::NotFound("Không lấy được kích thước phần tử".to_string()))?;
+        if ox != 0.0 || oy != 0.0 {
+            let x = clip.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) + ox;
+            let y = clip.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) + oy;
+            clip.insert("x".into(), json!(x));
+            clip.insert("y".into(), json!(y));
+        }
         clip.insert("scale".into(), json!(1));
         let res = self.cdp.call("Page.captureScreenshot", json!({
             "format": "png",
@@ -1256,6 +1460,7 @@ impl Tab {
         Ok(Tab {
             target_id: self.target_id.clone(),
             cdp: Arc::clone(&self.cdp),
+            rt: self.rt.clone(),
             proxy: self.proxy.clone(),
             browser_context_id: self.browser_context_id.clone(),
             frame_chain: chain,
@@ -1299,15 +1504,15 @@ impl Tab {
         let abs = std::fs::canonicalize(dir_path)
             .map_err(|e| DriverError::Io(format!("Đường dẫn không hợp lệ '{}': {}", download_dir, e)))?;
         let clean = abs.to_string_lossy().trim_start_matches(r"\\?\").to_string();
+        let mut params = Map::new();
+        params.insert("behavior".into(), json!("allow"));
+        params.insert("downloadPath".into(), json!(clean));
+        params.insert("eventsEnabled".into(), json!(true));
+        if let Some(ref cid) = self.browser_context_id {
+            params.insert("browserContextId".into(), json!(cid));
+        }
         self.cdp
-            .call_browser(
-                "Browser.setDownloadBehavior",
-                json!({
-                    "behavior": "allow",
-                    "downloadPath": clean,
-                    "eventsEnabled": true
-                }),
-            )
+            .call_browser("Browser.setDownloadBehavior", Value::Object(params))
             .await?;
         Ok(clean)
     }
@@ -1407,24 +1612,40 @@ impl Tab {
 
     pub async fn select_option(&self, selector: &str, value: &str, timeout_ms: u64) -> DriverResult<()> {
         self.wait_for_selector(selector, timeout_ms, false).await?;
-        let ok = self.evaluate(&format!(
-            "(() => {{ const el = {}; const v = {}; \
-             const opt = Array.from(el.options).find(o => o.value === v || o.text.trim() === v); \
+        let res = self.evaluate(&format!(
+            "(() => {{ const el = {}; if (!el) return null; const v = {}; \
+             const opt = Array.from(el.options ? el.options : []).find(o => o.value === v || o.text.trim() === v); \
              if (!opt) return false; el.value = opt.value; \
              el.dispatchEvent(new Event('input', {{ bubbles: true }})); \
              el.dispatchEvent(new Event('change', {{ bubbles: true }})); return true; }})()",
             sel_expr(selector), js_str(value)
         )).await?;
-        if ok == Value::Bool(true) {
-            Ok(())
-        } else {
-            Err(DriverError::NotFound(format!("Option '{}' trong '{}'", value, selector)))
+        match res {
+            Value::Bool(true) => Ok(()),
+            Value::Bool(false) => Err(DriverError::NotFound(format!("Option '{}' trong '{}'", value, selector))),
+            _ => {
+                if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+                    return self.select_option_node(nid, value).await;
+                }
+                Err(DriverError::NotFound(format!("Option '{}' trong '{}'", value, selector)))
+            }
         }
     }
 
     pub async fn set_checked(&self, selector: &str, checked: bool, timeout_ms: u64) -> DriverResult<()> {
         self.wait_for_selector(selector, timeout_ms, false).await?;
-        let cur = self.evaluate(&format!("{}.checked === true", sel_expr(selector))).await?;
+        let cur = self
+            .evaluate(&format!(
+                "(() => {{ const el = {}; return el ? (el.checked === true) : null; }})()",
+                sel_expr(selector)
+            ))
+            .await?;
+        if cur.is_null() {
+            if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+                return self.check_node(nid, checked).await;
+            }
+            return Err(DriverError::NotFound(selector.to_string()));
+        }
         if cur == Value::Bool(checked) {
             return Ok(());
         }
@@ -1432,7 +1653,7 @@ impl Tab {
             self.click(selector, "left", 1, timeout_ms).await
         } else {
             let label = format!(
-                "(() => {{ const el = {}; return el.closest('label') || (el.id && document.querySelector('label[for=\"' + el.id + '\"]')) || el.parentElement; }})()",
+                "(() => {{ const el = {}; return el.closest('label') || (el.id && document.querySelector('label[for=\"' + CSS.escape(el.id) + '\"]')) || el.parentElement; }})()",
                 sel_expr(selector)
             );
             let (x, y) = self.element_center(&label, selector).await?;
@@ -1448,15 +1669,24 @@ impl Tab {
                 .map_err(|e| DriverError::Io(format!("File không tồn tại '{}': {}", f, e)))?;
             abs.push(p.to_string_lossy().trim_start_matches(r"\\?\").to_string());
         }
-        let res = self.eval_raw(&sel_expr(selector), false).await?;
-        let object_id = res
-            .pointer("/result/objectId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| DriverError::NotFound(format!("Không lấy được objectId của '{}'", selector)))?
-            .to_string();
-        let out = self.cdp.call("DOM.setFileInputFiles", json!({ "files": abs, "objectId": object_id })).await;
-        self.release_object(&object_id).await;
-        out.map(|_| ())
+        if let Ok(res) = self.eval_raw(&sel_expr(selector), false).await {
+            if let Some(object_id) = res.pointer("/result/objectId").and_then(|v| v.as_str()) {
+                let out = self
+                    .cdp
+                    .call("DOM.setFileInputFiles", json!({ "files": abs, "objectId": object_id }))
+                    .await;
+                self.release_object(object_id).await;
+                return out.map(|_| ());
+            }
+        }
+        if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+            return self
+                .cdp
+                .call("DOM.setFileInputFiles", json!({ "files": abs, "backendNodeId": nid }))
+                .await
+                .map(|_| ());
+        }
+        Err(DriverError::NotFound(format!("Không lấy được phần tử file input '{}'", selector)))
     }
 
     // ───────────────────────────── Scrolling ─────────────────────────────
@@ -1506,9 +1736,19 @@ impl Tab {
 
     pub async fn scroll_into_view(&self, selector: &str, timeout_ms: u64) -> DriverResult<()> {
         self.wait_for_selector(selector, timeout_ms, false).await?;
-        self.evaluate(&format!("{}.scrollIntoView({{ block: 'center', behavior: 'instant' }})", sel_expr(selector)))
-            .await
-            .map(|_| ())
+        let ok = self
+            .evaluate(&format!(
+                "(() => {{ const el = {}; if (!el) return false; el.scrollIntoView({{ block: 'center', behavior: 'instant' }}); return true; }})()",
+                sel_expr(selector)
+            ))
+            .await?;
+        if ok == Value::Bool(true) {
+            return Ok(());
+        }
+        if let Some(&nid) = self.pierce_find_ids(selector).await.unwrap_or_default().first() {
+            return self.scroll_into_view_node(nid).await;
+        }
+        Err(DriverError::NotFound(selector.to_string()))
     }
 
     // ───────────────────────────── Emulation ─────────────────────────────
@@ -1545,10 +1785,132 @@ impl Tab {
     }
 
     pub async fn set_geolocation(&self, latitude: f64, longitude: f64, accuracy: f64) -> DriverResult<()> {
-        let _ = self.cdp.call_browser("Browser.grantPermissions", json!({ "permissions": ["geolocation"] })).await;
+        let _ = self.grant_permissions(&["geolocation".to_string()], None).await;
         self.cdp.call("Emulation.setGeolocationOverride", json!({
             "latitude": latitude, "longitude": longitude, "accuracy": accuracy
         })).await.map(|_| ())
+    }
+
+    /// Grants browser permissions (`"clipboard-read"`, `"clipboard-write"`, `"notifications"`, `"geolocation"`, etc.)
+    /// via `Browser.grantPermissions`, scoped to this tab's `BrowserContext` when present.
+    pub async fn grant_permissions(&self, permissions: &[String], origin: Option<&str>) -> DriverResult<()> {
+        let mapped: Vec<String> = permissions
+            .iter()
+            .map(|p| match p.as_str() {
+                "clipboard-read" => "clipboardReadWrite".to_string(),
+                "clipboard-write" => "clipboardSanitizedWrite".to_string(),
+                "microphone" => "audioCapture".to_string(),
+                "camera" => "videoCapture".to_string(),
+                "midi-sysex" => "midiSysex".to_string(),
+                "background-sync" => "backgroundSync".to_string(),
+                other => other.to_string(),
+            })
+            .collect();
+
+        let mut params = Map::new();
+        params.insert("permissions".into(), json!(mapped));
+        if let Some(orig) = origin {
+            params.insert("origin".into(), json!(orig));
+        } else if let Ok(cur) = self.evaluate_string("location.origin").await {
+            if cur.starts_with("http://") || cur.starts_with("https://") {
+                params.insert("origin".into(), json!(cur));
+            }
+        }
+        if let Some(ref cid) = self.browser_context_id {
+            params.insert("browserContextId".into(), json!(cid));
+        }
+        self.cdp
+            .call_browser("Browser.grantPermissions", Value::Object(params))
+            .await
+            .map(|_| ())
+    }
+
+    /// Returns the OS browser window bounds and state (`normal`/`minimized`/`maximized`/`fullscreen`) for this tab.
+    pub async fn get_window_bounds(&self) -> DriverResult<Value> {
+        let res = self
+            .cdp
+            .call_browser("Browser.getWindowForTarget", json!({ "targetId": self.target_id }))
+            .await?;
+        let wid = res.get("windowId").and_then(|v| v.as_i64()).unwrap_or(0);
+        let bounds = res.get("bounds").cloned().unwrap_or_else(|| json!({}));
+        Ok(json!({
+            "window_id": wid,
+            "left": bounds.get("left").cloned().unwrap_or(Value::Null),
+            "top": bounds.get("top").cloned().unwrap_or(Value::Null),
+            "width": bounds.get("width").cloned().unwrap_or(Value::Null),
+            "height": bounds.get("height").cloned().unwrap_or(Value::Null),
+            "state": bounds.get("windowState").cloned().unwrap_or_else(|| json!("normal")),
+        }))
+    }
+
+    /// Resizes, moves, or changes OS window state (`"normal"`, `"minimized"`, `"maximized"`, `"fullscreen"`).
+    pub async fn set_window_bounds(
+        &self,
+        width: Option<i64>,
+        height: Option<i64>,
+        left: Option<i64>,
+        top: Option<i64>,
+        state: Option<&str>,
+    ) -> DriverResult<()> {
+        let cur = self
+            .cdp
+            .call_browser("Browser.getWindowForTarget", json!({ "targetId": self.target_id }))
+            .await?;
+        let wid = cur
+            .get("windowId")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| DriverError::Connection("Browser.getWindowForTarget không trả windowId".to_string()))?;
+
+        let cur_state = cur
+            .pointer("/bounds/windowState")
+            .and_then(|v| v.as_str())
+            .unwrap_or("normal");
+        let has_geom = width.is_some() || height.is_some() || left.is_some() || top.is_some();
+
+        if let Some(st) = state {
+            if !matches!(st, "normal" | "minimized" | "maximized" | "fullscreen") {
+                return Err(DriverError::InvalidInput(format!(
+                    "Window state không hợp lệ '{}'; hỗ trợ normal, minimized, maximized, fullscreen",
+                    st
+                )));
+            }
+            if st != "normal" {
+                self.cdp
+                    .call_browser(
+                        "Browser.setWindowBounds",
+                        json!({ "windowId": wid, "bounds": { "windowState": st } }),
+                    )
+                    .await?;
+                return Ok(());
+            }
+        }
+
+        // CDP requires normal state before applying explicit width/height/left/top geometry
+        if has_geom && cur_state != "normal" {
+            self.cdp
+                .call_browser(
+                    "Browser.setWindowBounds",
+                    json!({ "windowId": wid, "bounds": { "windowState": "normal" } }),
+                )
+                .await?;
+        }
+
+        let mut bounds = Map::new();
+        if let Some(w) = width { bounds.insert("width".into(), json!(w)); }
+        if let Some(h) = height { bounds.insert("height".into(), json!(h)); }
+        if let Some(x) = left { bounds.insert("left".into(), json!(x)); }
+        if let Some(y) = top { bounds.insert("top".into(), json!(y)); }
+        if state == Some("normal") || bounds.is_empty() {
+            bounds.insert("windowState".into(), json!("normal"));
+        }
+
+        self.cdp
+            .call_browser(
+                "Browser.setWindowBounds",
+                json!({ "windowId": wid, "bounds": Value::Object(bounds) }),
+            )
+            .await
+            .map(|_| ())
     }
 
     // ───────────────────────────── Network ─────────────────────────────
@@ -1565,7 +1927,44 @@ impl Tab {
         self.cdp.call("Network.setCacheDisabled", json!({ "cacheDisabled": disabled })).await.map(|_| ())
     }
 
-    /// Awaits a network response matching a URL substring, waits for body transfer completion, and retrieves status/headers/body.
+    /// Matches `url` against either a `*`-wildcard glob or a plain substring pattern.
+    fn url_matches_pattern(url: &str, pattern: &str) -> bool {
+        if pattern.is_empty() || pattern == "*" {
+            return true;
+        }
+        if !pattern.contains('*') {
+            return url.contains(pattern);
+        }
+        let parts: Vec<&str> = pattern.split('*').collect();
+        let mut rest = url;
+        if let Some(first) = parts.first() {
+            if !first.is_empty() {
+                let Some(tail) = rest.strip_prefix(first) else {
+                    return false;
+                };
+                rest = tail;
+            }
+        }
+        for mid in &parts[1..parts.len().saturating_sub(1)] {
+            if mid.is_empty() {
+                continue;
+            }
+            let Some(pos) = rest.find(mid) else {
+                return false;
+            };
+            rest = &rest[pos + mid.len()..];
+        }
+        if parts.len() > 1 {
+            if let Some(last) = parts.last() {
+                if !last.is_empty() {
+                    return rest.ends_with(last);
+                }
+            }
+        }
+        true
+    }
+
+    /// Awaits a network response matching a URL substring or `*`-glob, waits for body transfer completion, and retrieves status/headers/body.
     pub async fn wait_for_response(&self, url_pattern: &str, timeout_ms: u64) -> DriverResult<Value> {
         let mut rx = self.cdp.subscribe();
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -1582,7 +1981,7 @@ impl Tab {
                     if method == "Network.responseReceived" {
                         if let Some(resp) = params.get("response") {
                             if let Some(u) = resp.get("url").and_then(|v| v.as_str()) {
-                                if u.contains(url_pattern) {
+                                if Self::url_matches_pattern(u, url_pattern) {
                                     let req_id = params.get("requestId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                                     matched_req_id = Some(req_id);
                                     matched_resp = Some(resp.clone());
@@ -1859,14 +2258,28 @@ impl Tab {
     }
 
     /// Exports Playwright / `http_tls`-compatible `storage_state` containing all CDP cookies (including `HttpOnly`),
-    /// exact browser headers, TLS `impersonate` preset, wire `header_order`, and `proxy`.
+    /// active origin `localStorage`, exact browser headers, TLS `impersonate` preset, wire `header_order`, and `proxy`.
     pub async fn storage_state(&self, path: Option<&str>) -> DriverResult<Value> {
         let cookies = self.get_cookies(None).await?;
         let fp = self.fingerprint().await?;
 
+        let origins = match self.evaluate(
+            "(() => { \
+                try { \
+                    const o = location.origin; \
+                    if (!o || (!o.startsWith('http://') && !o.startsWith('https://'))) return []; \
+                    const ls = Object.entries(localStorage).map(([name, value]) => ({ name, value: String(value) })); \
+                    return ls.length ? [{ origin: o, localStorage: ls }] : []; \
+                } catch (_) { return []; } \
+            })()"
+        ).await {
+            Ok(v) if v.is_array() => v,
+            _ => json!([]),
+        };
+
         let state = json!({
             "cookies": cookies,
-            "origins": [],
+            "origins": origins,
             "user_agent": fp.get("user_agent").cloned().unwrap_or(Value::Null),
             "headers": fp.get("headers").cloned().unwrap_or_else(|| json!({})),
             "impersonate": fp.get("impersonate").cloned().unwrap_or(Value::Null),
@@ -1884,6 +2297,50 @@ impl Tab {
                 .map_err(|e| DriverError::Io(format!("Lỗi ghi file storage_state '{}': {}", p, e)))?;
         }
         Ok(state)
+    }
+
+    /// Restores cookies (context-scoped) and matching-origin `localStorage` from a `storage_state` dict or JSON file.
+    pub async fn load_storage_state(&self, state: Value) -> DriverResult<Value> {
+        let obj = state
+            .as_object()
+            .ok_or_else(|| DriverError::InvalidInput("storage_state phải là dict hoặc đường dẫn JSON".to_string()))?;
+
+        let mut loaded_cookies = 0usize;
+        if let Some(cookies) = obj.get("cookies") {
+            if let Some(arr) = cookies.as_array() {
+                if !arr.is_empty() {
+                    self.set_cookies(cookies.clone()).await?;
+                    loaded_cookies = arr.len();
+                }
+            }
+        }
+
+        let mut loaded_ls = 0usize;
+        if let Some(origins) = obj.get("origins").and_then(|v| v.as_array()) {
+            let cur_origin = self.evaluate_string("location.origin").await.unwrap_or_default();
+            for entry in origins {
+                let Some(orig) = entry.get("origin").and_then(|v| v.as_str()) else { continue };
+                if !cur_origin.is_empty() && orig == cur_origin {
+                    if let Some(items) = entry.get("localStorage").and_then(|v| v.as_array()) {
+                        for item in items {
+                            if let (Some(k), Some(v)) = (
+                                item.get("name").and_then(|x| x.as_str()),
+                                item.get("value").and_then(|x| x.as_str()),
+                            ) {
+                                if self.storage_set(k, v, false).await.is_ok() {
+                                    loaded_ls += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(json!({
+            "cookies": loaded_cookies,
+            "local_storage": loaded_ls
+        }))
     }
 
     // ───────────────────────────── Cookies & Storage ─────────────────────────────
@@ -1916,6 +2373,7 @@ impl Tab {
         let list = cookies
             .as_array()
             .ok_or_else(|| DriverError::InvalidInput("cookies phải là list các dict".to_string()))?;
+        let mut fallback_url: Option<String> = None;
         let mut clean = Vec::with_capacity(list.len());
         for c in list {
             let obj = c
@@ -1924,6 +2382,26 @@ impl Tab {
             let mut m = Map::new();
             for k in KEEP {
                 if let Some(v) = obj.get(k) {
+                    if matches!(k, "url" | "domain" | "path" | "sameSite") {
+                        if let Some(s) = v.as_str() {
+                            let trimmed = s.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+                            if k == "sameSite" {
+                                let norm = match trimmed.to_ascii_lowercase().as_str() {
+                                    "strict" => "Strict",
+                                    "lax" => "Lax",
+                                    "none" => "None",
+                                    _ => continue,
+                                };
+                                m.insert(k.to_string(), json!(norm));
+                                continue;
+                            }
+                        } else if v.is_null() {
+                            continue;
+                        }
+                    }
                     m.insert(k.to_string(), v.clone());
                 }
             }
@@ -1932,11 +2410,41 @@ impl Tab {
             if session || neg_exp {
                 m.remove("expires");
             }
+            // Chromium requires `secure: true` for `sameSite: "None"`; normalize so CDP never rejects with -32602
+            if m.get("sameSite").and_then(|v| v.as_str()) == Some("None") {
+                let is_http = m
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(|u| u.starts_with("http://"))
+                    .unwrap_or(false);
+                if is_http && m.get("secure").and_then(|v| v.as_bool()) == Some(false) {
+                    m.remove("sameSite");
+                } else {
+                    m.insert("secure".to_string(), json!(true));
+                }
+            }
             if !m.contains_key("url") && !m.contains_key("domain") {
-                return Err(DriverError::InvalidInput(format!(
-                    "Cookie '{}' thiếu 'domain' hoặc 'url'",
-                    obj.get("name").and_then(|v| v.as_str()).unwrap_or("?")
-                )));
+                if fallback_url.is_none() {
+                    let cur = self.current_url().await.unwrap_or_default();
+                    fallback_url = Some(
+                        if cur.starts_with("http://") || cur.starts_with("https://") {
+                            cur
+                        } else {
+                            String::new()
+                        },
+                    );
+                }
+                if let Some(ref u) = fallback_url {
+                    if !u.is_empty() {
+                        m.insert("url".to_string(), json!(u));
+                    }
+                }
+                if !m.contains_key("url") && !m.contains_key("domain") {
+                    return Err(DriverError::InvalidInput(format!(
+                        "Cookie '{}' thiếu 'domain' hoặc 'url'",
+                        obj.get("name").and_then(|v| v.as_str()).unwrap_or("?")
+                    )));
+                }
             }
             clean.push(Value::Object(m));
         }
@@ -2056,7 +2564,8 @@ impl Tab {
         };
         let mut rx = self.cdp.subscribe();
         let cdp = Arc::clone(&self.cdp);
-        *slot = Some(tokio::spawn(async move {
+        // Spawn on the captured Tokio runtime handle so sync Python calls (`tab.auto_dialog(...)`) never panic
+        *slot = Some(self.rt.spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok((m, _)) if m == "Page.javascriptDialogOpening" => {
@@ -2099,16 +2608,37 @@ impl Tab {
 
         if let Some(sel) = selector {
             self.wait_for_selector(sel, 10000, true).await?;
-            let r = self.evaluate(&format!(
-                "(() => {{ const el = {}; el.scrollIntoView({{ block: 'center', behavior: 'instant' }}); \
+            let (ox, oy) = self.frame_viewport_offset().await;
+            let mut r = self.evaluate(&format!(
+                "(() => {{ const el = {}; if (!el) return null; \
+                 el.scrollIntoView({{ block: 'center', behavior: 'instant' }}); \
                  const r = el.getBoundingClientRect(); \
                  return {{ x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height }}; }})()",
                 sel_expr(sel)
             )).await?;
+            if r.is_null() {
+                if let Some(&nid) = self.pierce_find_ids(sel).await.unwrap_or_default().first() {
+                    r = self.call_on_node(
+                        nid,
+                        "function() { \
+                            this.scrollIntoView({ block: 'center', behavior: 'instant' }); \
+                            const b = this.getBoundingClientRect(); \
+                            return { x: b.left + scrollX, y: b.top + scrollY, width: b.width, height: b.height }; \
+                        }",
+                        vec![],
+                    ).await?;
+                }
+            }
             let mut clip = r
                 .as_object()
                 .cloned()
                 .ok_or_else(|| DriverError::NotFound("Không lấy được kích thước phần tử".to_string()))?;
+            if ox != 0.0 || oy != 0.0 {
+                let x = clip.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) + ox;
+                let y = clip.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) + oy;
+                clip.insert("x".into(), json!(x));
+                clip.insert("y".into(), json!(y));
+            }
             clip.insert("scale".into(), json!(1));
             p.insert("clip".into(), Value::Object(clip));
             p.insert("captureBeyondViewport".into(), json!(true));

@@ -3,6 +3,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinHandle;
@@ -14,7 +15,7 @@ mod input;
 mod locator;
 mod tab;
 
-use browser::{build_headless_ua_override, BrowserProcess};
+use browser::{build_headless_ua_override, resolve_cdp_ws_url, BrowserProcess};
 use cdp::{CdpConnection, SessionEventRx};
 use error::{DriverError, DriverResult};
 use tab::{Tab, EVASION_JS};
@@ -100,6 +101,33 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         .call_method1("dumps", (obj,))?
         .extract()?;
     serde_json::from_str(&dumped).map_err(|e| rt(DriverError::InvalidInput(e.to_string())))
+}
+
+/// Converts a Python `str` or `os.PathLike` (`pathlib.Path`) into a UTF-8 path string.
+fn py_to_path(obj: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(s);
+    }
+    if let Ok(fspath_fn) = obj.getattr("__fspath__") {
+        let res = fspath_fn.call0()?;
+        if let Ok(s) = res.extract::<String>() {
+            return Ok(s);
+        }
+        if let Ok(b) = res.extract::<Vec<u8>>() {
+            return String::from_utf8(b)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()));
+        }
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "expected str or os.PathLike",
+    ))
+}
+
+fn py_to_opt_path(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<String>> {
+    match obj {
+        Some(v) if !v.is_none() => Ok(Some(py_to_path(v)?)),
+        _ => Ok(None),
+    }
 }
 
 struct PyJson(Value);
@@ -197,12 +225,15 @@ fn split_proxy(raw: &str) -> (String, Option<ProxyAuth>) {
 type ArmedMap = Arc<Mutex<HashMap<String, Arc<OnceCell<()>>>>>;
 
 /// Injects evasion script + headless UA override + nested OOPIF auto-attach ONCE per target (race-free via OnceCell).
+/// Pipelines commands concurrently with optional `Runtime.runIfWaitingForDebugger` in strict wire order so
+/// `<a target="_blank">` (`canAccessOpener: false`) targets paused at `waitForDebuggerOnStart` never deadlock.
 async fn arm_target_once(
     conn: &Arc<CdpConnection>,
     armed: &ArmedMap,
     target_id: &str,
     session_id: &str,
     headless_ua: Option<&Value>,
+    resume_if_waiting: bool,
 ) {
     let cell = {
         let mut map = armed.lock().await;
@@ -212,31 +243,36 @@ async fn arm_target_once(
         )
     };
     cell.get_or_init(|| async {
-        let _ = conn.call_raw(Some(session_id), "Page.enable", json!({})).await;
-        if let Some(ua_params) = headless_ua {
-            let _ = conn
-                .call_raw(Some(session_id), "Emulation.setUserAgentOverride", ua_params.clone())
-                .await;
-        }
-        let _ = conn
-            .call_raw(
-                Some(session_id),
-                "Page.addScriptToEvaluateOnNewDocument",
-                json!({ "source": EVASION_JS }),
-            )
-            .await;
-        // Auto-attach nested OOPIF iframes inside this target before their JS runs
-        let _ = conn
-            .call_raw(
-                Some(session_id),
-                "Target.setAutoAttach",
-                json!({
-                    "autoAttach": true,
-                    "waitForDebuggerOnStart": true,
-                    "flatten": true
-                }),
-            )
-            .await;
+        let f_ua = async {
+            if let Some(ua_params) = headless_ua {
+                let _ = conn
+                    .call_raw(Some(session_id), "Emulation.setUserAgentOverride", ua_params.clone())
+                    .await;
+            }
+        };
+        let f_evasion = conn.call_raw(
+            Some(session_id),
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": EVASION_JS }),
+        );
+        let f_page = conn.call_raw(Some(session_id), "Page.enable", json!({}));
+        let f_auto = conn.call_raw(
+            Some(session_id),
+            "Target.setAutoAttach",
+            json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": true,
+                "flatten": true
+            }),
+        );
+        let f_resume = async {
+            if resume_if_waiting {
+                let _ = conn
+                    .call_raw(Some(session_id), "Runtime.runIfWaitingForDebugger", json!({}))
+                    .await;
+            }
+        };
+        let (_, _, _, _, _) = tokio::join!(f_ua, f_evasion, f_page, f_auto, f_resume);
     })
     .await;
 }
@@ -250,11 +286,14 @@ pub struct BrowserCore {
     sessions_by_target: Arc<Mutex<HashMap<String, String>>>,
     armed_targets: ArmedMap,
     crashed_sessions: Arc<Mutex<HashSet<String>>>,
+    api_created_targets: Arc<Mutex<HashSet<String>>>,
     context_configs: ContextConfigMap,
     headless_ua: Option<Value>,
     proxy: Option<String>,
     proxy_auth: Option<ProxyAuth>,
     auto_attach_task: Mutex<Option<JoinHandle<()>>>,
+    detached: Arc<AtomicBool>,
+    closed: AtomicBool,
     port: u16,
     user_data_dir: String,
     ws_url: String,
@@ -294,6 +333,7 @@ impl BrowserCore {
         browser_path: Option<String>,
         extra_args: Option<Vec<String>>,
         proxy: Option<String>,
+        keep_open: bool,
     ) -> DriverResult<Self> {
         let mut args = extra_args.unwrap_or_default();
         let raw_proxy = proxy.clone();
@@ -307,11 +347,40 @@ impl BrowserCore {
             }
             proxy_auth = auth;
         }
-        let proc = BrowserProcess::launch(headless, user_data_dir, browser_path, Some(args)).await?;
+        let detached = Arc::new(AtomicBool::new(keep_open));
+        let proc = BrowserProcess::launch(
+            headless,
+            user_data_dir,
+            browser_path,
+            Some(args),
+            Arc::clone(&detached),
+        )
+        .await?;
         let port = proc.port;
         let ws_url = proc.ws_url.clone();
         let user_data_dir = proc.user_data_dir.to_string_lossy().to_string();
 
+        Self::from_parts(Some(proc), port, user_data_dir, ws_url, raw_proxy, proxy_auth, detached).await
+    }
+
+    async fn connect_existing(endpoint: &str, proxy: Option<String>) -> DriverResult<Self> {
+        let (ws_url, port) = resolve_cdp_ws_url(endpoint).await?;
+        let raw_proxy = proxy.clone();
+        let proxy_auth = proxy.as_deref().and_then(|p| split_proxy(p).1);
+        // Externally launched browsers are always detached so stop()/Drop never kill them
+        let detached = Arc::new(AtomicBool::new(true));
+        Self::from_parts(None, port, String::new(), ws_url, raw_proxy, proxy_auth, detached).await
+    }
+
+    async fn from_parts(
+        proc: Option<BrowserProcess>,
+        port: u16,
+        user_data_dir: String,
+        ws_url: String,
+        raw_proxy: Option<String>,
+        proxy_auth: Option<ProxyAuth>,
+        detached: Arc<AtomicBool>,
+    ) -> DriverResult<Self> {
         // Single browser-level CDP WebSocket shared by all tabs, popups, and OOPIF iframes
         let conn = CdpConnection::connect(&ws_url).await?;
 
@@ -328,6 +397,7 @@ impl BrowserCore {
             Arc::new(Mutex::new(HashMap::new()));
         let armed_targets: ArmedMap = Arc::new(Mutex::new(HashMap::new()));
         let crashed_sessions: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let api_created_targets: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let context_configs: ContextConfigMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Subscribe BEFORE enabling Target.setAutoAttach so no early child target event is missed
@@ -337,6 +407,7 @@ impl BrowserCore {
         let sessions_sup = Arc::clone(&sessions_by_target);
         let armed_sup = Arc::clone(&armed_targets);
         let crashed_sup = Arc::clone(&crashed_sessions);
+        let api_sup = Arc::clone(&api_created_targets);
         let ua_sup = headless_ua.clone();
 
         let auto_attach_task = tokio::spawn(async move {
@@ -347,6 +418,56 @@ impl BrowserCore {
                     Err(_) => break,
                 };
                 match ev.method.as_str() {
+                    "Target.targetCreated" => {
+                        let ttype = ev
+                            .params
+                            .pointer("/targetInfo/type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let tid = ev
+                            .params
+                            .pointer("/targetInfo/targetId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let opener_id = ev
+                            .params
+                            .pointer("/targetInfo/openerId")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty());
+                        let bcid = ev
+                            .params
+                            .pointer("/targetInfo/browserContextId")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                        // Opener-less page targets (e.g. `<a target="_blank">` with implicit `rel="noopener"`)
+                        // are not auto-attached by the opener session; emit popupReady once we verify
+                        // they were not created programmatically by `new_tab()`.
+                        if ttype == "page" && !tid.is_empty() && opener_id.is_none() {
+                            let api_c = Arc::clone(&api_sup);
+                            let sessions_c = Arc::clone(&sessions_sup);
+                            let conn_c = Arc::clone(&conn_sup);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(35)).await;
+                                if api_c.lock().await.contains(&tid)
+                                    || sessions_c.lock().await.contains_key(&tid)
+                                {
+                                    return;
+                                }
+                                conn_c.emit_internal(
+                                    "_internal.popupReady",
+                                    json!({
+                                        "targetInfo": {
+                                            "targetId": tid,
+                                            "openerId": Value::Null,
+                                            "browserContextId": bcid,
+                                        }
+                                    }),
+                                );
+                            });
+                        }
+                    }
                     "Target.attachedToTarget" => {
                         let Some(sid) = ev.params.get("sessionId").and_then(|v| v.as_str()).map(str::to_string) else {
                             continue;
@@ -387,26 +508,29 @@ impl BrowserCore {
 
                         let conn_c = Arc::clone(&conn_sup);
                         let armed_c = Arc::clone(&armed_sup);
+                        let api_c = Arc::clone(&api_sup);
                         let ua_c = ua_sup.clone();
                         tokio::spawn(async move {
                             if (ttype == "page" || ttype == "iframe") && !tid.is_empty() {
-                                arm_target_once(&conn_c, &armed_c, &tid, &sid, ua_c.as_ref()).await;
-                            }
-                            // Unconditionally resume paused targets so nothing can ever hang
-                            if waiting {
+                                arm_target_once(&conn_c, &armed_c, &tid, &sid, ua_c.as_ref(), waiting).await;
+                            } else if waiting {
+                                // Unconditionally resume non-page/iframe paused targets (workers, etc.)
                                 let _ = conn_c
                                     .call_raw(Some(&sid), "Runtime.runIfWaitingForDebugger", json!({}))
                                     .await;
                             }
-                            // Notify popup waiters ONLY after stealth arming + debugger resume finish
+                            // Notify popup waiters ONLY after stealth arming + debugger resume finish.
+                            // Also emit when openerId is absent (implicit rel="noopener" on <a target="_blank">)
+                            // as long as the target was not created programmatically by new_tab().
                             if ttype == "page" && !tid.is_empty() {
-                                if let Some(opener) = opener_id {
+                                let is_api = api_c.lock().await.contains(&tid);
+                                if opener_id.is_some() || !is_api {
                                     conn_c.emit_internal(
                                         "_internal.popupReady",
                                         json!({
                                             "targetInfo": {
                                                 "targetId": tid,
-                                                "openerId": opener,
+                                                "openerId": opener_id,
                                                 "browserContextId": bcid,
                                             }
                                         }),
@@ -432,6 +556,7 @@ impl BrowserCore {
                             tabs_sup.lock().await.remove(tid);
                             sessions_sup.lock().await.remove(tid);
                             armed_sup.lock().await.remove(tid);
+                            api_sup.lock().await.remove(tid);
                         }
                     }
                     _ => {}
@@ -452,21 +577,37 @@ impl BrowserCore {
             .await;
 
         Ok(Self {
-            process: Mutex::new(Some(proc)),
+            process: Mutex::new(proc),
             conn,
             tabs,
             sessions_by_target,
             armed_targets,
             crashed_sessions,
+            api_created_targets,
             context_configs,
             headless_ua,
             proxy: raw_proxy,
             proxy_auth,
             auto_attach_task: Mutex::new(Some(auto_attach_task)),
+            detached,
+            closed: AtomicBool::new(false),
             port,
             user_data_dir,
             ws_url,
         })
+    }
+
+    async fn ensure_open(&self) -> DriverResult<()> {
+        if self.closed.load(Ordering::SeqCst) || !self.conn.is_open() {
+            return Err(DriverError::BrowserClosed);
+        }
+        let mut lock = self.process.lock().await;
+        if let Some(proc) = lock.as_mut() {
+            if !proc.is_alive() {
+                return Err(DriverError::BrowserClosed);
+            }
+        }
+        Ok(())
     }
 
     async fn attach(&self, target_id: String) -> DriverResult<Arc<Tab>> {
@@ -511,6 +652,7 @@ impl BrowserCore {
             &target_id,
             &session_id,
             self.headless_ua.as_ref(),
+            false,
         )
         .await;
 
@@ -532,9 +674,7 @@ impl BrowserCore {
         proxy: Option<String>,
         proxy_bypass_list: Option<String>,
     ) -> DriverResult<(String, Option<String>, Option<ProxyAuth>)> {
-        if self.process.lock().await.is_none() {
-            return Err(DriverError::BrowserClosed);
-        }
+        self.ensure_open().await?;
         let mut params = serde_json::Map::new();
         params.insert("disposeOnDetach".into(), json!(true));
         let mut ctx_auth = None;
@@ -567,9 +707,7 @@ impl BrowserCore {
         proxy_auth: Option<ProxyAuth>,
         opts: &ContextOptions,
     ) -> DriverResult<Arc<Tab>> {
-        if self.process.lock().await.is_none() {
-            return Err(DriverError::BrowserClosed);
-        }
+        self.ensure_open().await?;
         let res = self
             .conn
             .call(
@@ -582,6 +720,7 @@ impl BrowserCore {
             .and_then(|v| v.as_str())
             .ok_or_else(|| DriverError::Connection("Target.createTarget không trả targetId".to_string()))?
             .to_string();
+        self.api_created_targets.lock().await.insert(target_id.clone());
         let tab = self
             .attach_with_context(target_id, proxy, proxy_auth, Some(ctx_id.to_string()))
             .await?;
@@ -599,9 +738,7 @@ impl BrowserCore {
         proxy_auth: Option<ProxyAuth>,
         opts: &ContextOptions,
     ) -> DriverResult<Vec<Arc<Tab>>> {
-        if self.process.lock().await.is_none() {
-            return Err(DriverError::BrowserClosed);
-        }
+        self.ensure_open().await?;
         let res = self.conn.call("Target.getTargets", json!({})).await?;
         let page_ids: Vec<String> = res
             .get("targetInfos")
@@ -644,9 +781,7 @@ impl BrowserCore {
         target_id: String,
         browser_context_id: Option<String>,
     ) -> DriverResult<Arc<Tab>> {
-        if self.process.lock().await.is_none() {
-            return Err(DriverError::BrowserClosed);
-        }
+        self.ensure_open().await?;
         if let Some(cached) = self.tabs.lock().await.get(&target_id).cloned() {
             return Ok(cached);
         }
@@ -701,9 +836,7 @@ impl BrowserCore {
 
     /// Page targets via browser WebSocket `Target.getTargets` (zero HTTP polling).
     async fn list_tabs(&self) -> DriverResult<Vec<Arc<Tab>>> {
-        if self.process.lock().await.is_none() {
-            return Err(DriverError::BrowserClosed);
-        }
+        self.ensure_open().await?;
         let res = self.conn.call("Target.getTargets", json!({})).await?;
         let page_ids: Vec<String> = res
             .get("targetInfos")
@@ -740,9 +873,7 @@ impl BrowserCore {
     }
 
     async fn new_tab(&self, url: &str) -> DriverResult<Arc<Tab>> {
-        if self.process.lock().await.is_none() {
-            return Err(DriverError::BrowserClosed);
-        }
+        self.ensure_open().await?;
         // Create blank target via CDP WebSocket so evasion + proxy auth are armed before first navigation
         let res = self
             .conn
@@ -753,6 +884,7 @@ impl BrowserCore {
             .and_then(|v| v.as_str())
             .ok_or_else(|| DriverError::Connection("Target.createTarget không trả targetId".to_string()))?
             .to_string();
+        self.api_created_targets.lock().await.insert(target_id.clone());
         let tab = self.attach(target_id).await?;
         if url != "about:blank" {
             tab.get(url, None, "load").await?;
@@ -761,14 +893,39 @@ impl BrowserCore {
     }
 
     async fn is_alive(&self) -> bool {
+        if self.closed.load(Ordering::SeqCst) || !self.conn.is_open() {
+            return false;
+        }
         let mut lock = self.process.lock().await;
         match lock.as_mut() {
             Some(proc) => proc.is_alive(),
-            None => false,
+            None => true,
+        }
+    }
+
+    fn detach(&self) {
+        self.detached.store(true, Ordering::SeqCst);
+    }
+
+    async fn wait_until_closed(&self, poll_ms: u64) {
+        let step = std::time::Duration::from_millis(poll_ms.max(50));
+        let mut rx = self.conn.subscribe();
+        while self.is_alive().await {
+            tokio::select! {
+                ev = rx.recv() => {
+                    match ev {
+                        Ok(e) if e.method == "_internal.wsClosed" => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep(step) => {}
+            }
         }
     }
 
     async fn stop(&self) -> Vec<String> {
+        self.closed.store(true, Ordering::SeqCst);
         if let Some(h) = self.auto_attach_task.lock().await.take() {
             h.abort();
         }
@@ -789,13 +946,24 @@ impl BrowserCore {
         }
         self.armed_targets.lock().await.clear();
         self.crashed_sessions.lock().await.clear();
+        self.api_created_targets.lock().await.clear();
         self.context_configs.lock().await.clear();
+
+        if self.detached.load(Ordering::SeqCst) {
+            // Detached / keep_open / externally connected: close our CDP WebSocket immediately
+            // so Chromium tears down Fetch/sessions created on this connection, while leaving Chromium alive.
+            self.conn.close();
+            let _ = self.process.lock().await.take();
+            return sids;
+        }
+
         // Ask Chromium to close gracefully first so persistent profiles flush SQLite/Cookies cleanly
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(1500),
             self.conn.call("Browser.close", json!({})),
         )
         .await;
+        self.conn.close();
         if let Some(mut proc) = self.process.lock().await.take() {
             proc.wait_graceful_or_kill(std::time::Duration::from_millis(1500));
         }
@@ -975,9 +1143,14 @@ impl PyElement {
     }
 
     #[pyo3(signature = (file_path=None))]
-    fn screenshot<'py>(&self, py: Python<'py>, file_path: Option<String>) -> PyResult<Bound<'py, PyAny>> {
+    fn screenshot<'py>(
+        &self,
+        py: Python<'py>,
+        file_path: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let path = py_to_opt_path(file_path)?;
         let nid = self.backend_node_id;
-        fut!(py, self.tab, |t| t.screenshot_node(nid, file_path).await.map(PyBin))
+        fut!(py, self.tab, |t| t.screenshot_node(nid, path).await.map(PyBin))
     }
 
     fn ele<'py>(&self, py: Python<'py>, query: String) -> PyResult<Bound<'py, PyAny>> {
@@ -1098,8 +1271,37 @@ impl PyTab {
     }
 
     #[pyo3(signature = (path=None))]
-    fn storage_state<'py>(&self, py: Python<'py>, path: Option<String>) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |t| t.storage_state(path.as_deref()).await.map(PyJson))
+    fn storage_state<'py>(
+        &self,
+        py: Python<'py>,
+        path: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let p = py_to_opt_path(path)?;
+        fut!(py, self.inner, |t| t.storage_state(p.as_deref()).await.map(PyJson))
+    }
+
+    fn load_storage_state<'py>(&self, py: Python<'py>, state_or_path: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let path_opt: Option<String> = py_to_path(state_or_path).ok();
+        let val_opt: Option<Value> = if path_opt.is_none() {
+            Some(py_to_value(state_or_path)?)
+        } else {
+            None
+        };
+        let t = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let state = match (path_opt, val_opt) {
+                (Some(p), _) => {
+                    let raw = tokio::fs::read(&p)
+                        .await
+                        .map_err(|e| rt(DriverError::Io(format!("Lỗi đọc storage_state '{}': {}", p, e))))?;
+                    serde_json::from_slice::<Value>(&raw)
+                        .map_err(|e| rt(DriverError::InvalidInput(format!("JSON storage_state hỏng: {}", e))))?
+                }
+                (_, Some(v)) => v,
+                _ => return Err(rt(DriverError::InvalidInput("storage_state không hợp lệ".to_string()))),
+            };
+            t.load_storage_state(state).await.map(PyJson).map_err(rt)
+        })
     }
 
     #[pyo3(signature = (async_mode=true, **kwargs))]
@@ -1143,19 +1345,25 @@ impl PyTab {
         fut!(py, self.inner, |t| t.frames().await.map(PyJson))
     }
 
-    fn set_download_dir<'py>(&self, py: Python<'py>, download_dir: String) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |t| t.set_download_dir(&download_dir).await)
+    fn set_download_dir<'py>(
+        &self,
+        py: Python<'py>,
+        download_dir: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let dir = py_to_path(download_dir)?;
+        fut!(py, self.inner, |t| t.set_download_dir(&dir).await)
     }
 
     #[pyo3(signature = (download_dir, timeout_ms=30000))]
     fn wait_for_download<'py>(
         &self,
         py: Python<'py>,
-        download_dir: String,
+        download_dir: &Bound<'py, PyAny>,
         timeout_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let dir = py_to_path(download_dir)?;
         fut!(py, self.inner, |t| t
-            .wait_for_download(&download_dir, timeout_ms)
+            .wait_for_download(&dir, timeout_ms)
             .await
             .map(PyJson))
     }
@@ -1505,9 +1713,14 @@ impl PyTab {
         files: &Bound<'py, PyAny>,
         timeout_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let list: Vec<String> = match files.extract::<String>() {
-            Ok(one) => vec![one],
-            Err(_) => files.extract()?,
+        let list: Vec<String> = if let Ok(one) = py_to_path(files) {
+            vec![one]
+        } else {
+            let mut out = Vec::new();
+            for item in files.try_iter()? {
+                out.push(py_to_path(&item?)?);
+            }
+            out
         };
         fut!(py, self.inner, |t| t.upload_file(&selector, &list, timeout_ms).await)
     }
@@ -1590,6 +1803,33 @@ impl PyTab {
         fut!(py, self.inner, |t| t.set_geolocation(latitude, longitude, accuracy).await)
     }
 
+    #[pyo3(signature = (permissions, origin=None))]
+    fn grant_permissions<'py>(
+        &self,
+        py: Python<'py>,
+        permissions: Vec<String>,
+        origin: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        fut!(py, self.inner, |t| t.grant_permissions(&permissions, origin.as_deref()).await)
+    }
+
+    fn get_window_bounds<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        fut!(py, self.inner, |t| t.get_window_bounds().await.map(PyJson))
+    }
+
+    #[pyo3(signature = (width=None, height=None, left=None, top=None, state=None))]
+    fn set_window_bounds<'py>(
+        &self,
+        py: Python<'py>,
+        width: Option<i64>,
+        height: Option<i64>,
+        left: Option<i64>,
+        top: Option<i64>,
+        state: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        fut!(py, self.inner, |t| t.set_window_bounds(width, height, left, top, state.as_deref()).await)
+    }
+
     // network
     fn set_extra_headers<'py>(&self, py: Python<'py>, headers: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let h = py_to_value(headers)?;
@@ -1658,12 +1898,14 @@ impl PyTab {
         fut!(py, self.inner, |t| t.clear_cookies().await)
     }
 
-    fn save_cookies<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |t| t.save_cookies(&path).await)
+    fn save_cookies<'py>(&self, py: Python<'py>, path: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let p = py_to_path(path)?;
+        fut!(py, self.inner, |t| t.save_cookies(&p).await)
     }
 
-    fn load_cookies<'py>(&self, py: Python<'py>, path: String) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |t| t.load_cookies(&path).await)
+    fn load_cookies<'py>(&self, py: Python<'py>, path: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+        let p = py_to_path(path)?;
+        fut!(py, self.inner, |t| t.load_cookies(&p).await)
     }
 
     #[pyo3(signature = (key=None, session=false))]
@@ -1710,21 +1952,28 @@ impl PyTab {
     fn screenshot<'py>(
         &self,
         py: Python<'py>,
-        file_path: Option<String>,
+        file_path: Option<&Bound<'py, PyAny>>,
         full_page: bool,
         format: String,
         quality: Option<i64>,
         selector: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let p = py_to_opt_path(file_path)?;
         fut!(py, self.inner, |t| t
-            .screenshot(file_path, full_page, &format, quality, selector.as_deref())
+            .screenshot(p, full_page, &format, quality, selector.as_deref())
             .await
             .map(PyBin))
     }
 
     #[pyo3(signature = (file_path=None, landscape=false))]
-    fn pdf<'py>(&self, py: Python<'py>, file_path: Option<String>, landscape: bool) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |t| t.pdf(file_path, landscape).await.map(PyBin))
+    fn pdf<'py>(
+        &self,
+        py: Python<'py>,
+        file_path: Option<&Bound<'py, PyAny>>,
+        landscape: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let p = py_to_opt_path(file_path)?;
+        fut!(py, self.inner, |t| t.pdf(p, landscape).await.map(PyBin))
     }
 
     fn sleep<'py>(&self, py: Python<'py>, seconds: f64) -> PyResult<Bound<'py, PyAny>> {
@@ -1773,9 +2022,10 @@ impl PyTab {
 
     fn _popup_event_stream(&self) -> PyEventStream {
         PyEventStream {
-            rx: Arc::new(Mutex::new(
-                self.inner.cdp.subscribe_popups(self.inner.target_id.clone()),
-            )),
+            rx: Arc::new(Mutex::new(self.inner.cdp.subscribe_popups(
+                self.inner.target_id.clone(),
+                self.inner.context_id().map(str::to_string),
+            ))),
             methods: Arc::new(None),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -1875,10 +2125,11 @@ impl PyTab {
     fn export_har<'py>(
         slf: Py<Self>,
         py: Python<'py>,
-        path: Option<String>,
+        path: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        let p = py_to_opt_path(path)?;
         let m = py.import("best_driver.network")?;
-        m.call_method1("export_har", (slf, path))
+        m.call_method1("export_har", (slf, p))
     }
 
     fn stop_har<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -2176,6 +2427,18 @@ impl PyBrowser {
         fut!(py, self.inner, |c| Ok::<bool, DriverError>(c.is_alive().await))
     }
 
+    fn detach(&self) {
+        self.inner.detach();
+    }
+
+    #[pyo3(signature = (poll_ms=250))]
+    fn wait_until_closed<'py>(&self, py: Python<'py>, poll_ms: u64) -> PyResult<Bound<'py, PyAny>> {
+        fut!(py, self.inner, |c| {
+            c.wait_until_closed(poll_ms).await;
+            Ok::<(), DriverError>(())
+        })
+    }
+
     fn main_tab<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         fut!(py, self.inner, |c| {
             let bw = Some(Arc::downgrade(&c));
@@ -2337,19 +2600,47 @@ impl PyBrowser {
 
 /// Launch a browser over a single flattened browser-level CDP WebSocket.
 #[pyfunction]
-#[pyo3(signature = (headless=false, user_data_dir=None, browser_path=None, extra_args=None, proxy=None))]
+#[pyo3(signature = (headless=false, user_data_dir=None, browser_path=None, extra_args=None, proxy=None, keep_open=false))]
 fn start<'py>(
     py: Python<'py>,
     headless: bool,
-    user_data_dir: Option<String>,
-    browser_path: Option<String>,
+    user_data_dir: Option<&Bound<'py, PyAny>>,
+    browser_path: Option<&Bound<'py, PyAny>>,
     extra_args: Option<Vec<String>>,
     proxy: Option<String>,
+    keep_open: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let data_dir = py_to_opt_path(user_data_dir)?;
+    let bin_path = py_to_opt_path(browser_path)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let core = BrowserCore::launch(headless, user_data_dir, browser_path, extra_args, proxy)
+        let core = BrowserCore::launch(headless, data_dir, bin_path, extra_args, proxy, keep_open)
             .await
             .map_err(rt)?;
+        Ok(PyBrowser {
+            inner: Arc::new(core),
+        })
+    })
+}
+
+/// Connect to an already-running Chromium instance over CDP (`port`, `"http://host:port"`, or `"ws://..."`).
+#[pyfunction]
+#[pyo3(signature = (endpoint, proxy=None))]
+fn connect<'py>(
+    py: Python<'py>,
+    endpoint: &Bound<'py, PyAny>,
+    proxy: Option<String>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let ep: String = if let Ok(p) = endpoint.extract::<u16>() {
+        p.to_string()
+    } else if let Ok(s) = endpoint.extract::<String>() {
+        s
+    } else {
+        return Err(rt(DriverError::InvalidInput(
+            "endpoint phải là số port (int) hoặc chuỗi URL/host:port (str)".to_string(),
+        )));
+    };
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let core = BrowserCore::connect_existing(&ep, proxy).await.map_err(rt)?;
         Ok(PyBrowser {
             inner: Arc::new(core),
         })
@@ -2364,6 +2655,7 @@ fn best_driver(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyElement>()?;
     m.add_class::<PyEventStream>()?;
     m.add_function(wrap_pyfunction!(start, m)?)?;
+    m.add_function(wrap_pyfunction!(connect, m)?)?;
     Ok(())
 }
 

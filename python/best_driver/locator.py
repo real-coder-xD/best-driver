@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
-from typing import Any, List, Literal, Optional, Tuple
+from typing import Any, List, Literal, Optional, Tuple, Union
 
 LocatorState = Literal["attached", "visible", "hidden", "detached"]
 
@@ -16,8 +17,8 @@ class _Step:
         self,
         query: str,
         index: Optional[int] = None,
-        has_text: Optional[str] = None,
-        has_not_text: Optional[str] = None,
+        has_text: Tuple[str, ...] = (),
+        has_not_text: Tuple[str, ...] = (),
     ) -> None:
         self.query = query
         self.index = index
@@ -66,10 +67,10 @@ class Locator:
         parts = []
         for st in self._steps:
             s = st.query
-            if st.has_text is not None:
-                s += f":has-text({st.has_text!r})"
-            if st.has_not_text is not None:
-                s += f":not-text({st.has_not_text!r})"
+            for ht in st.has_text:
+                s += f":has-text({ht!r})"
+            for hnt in st.has_not_text:
+                s += f":not-text({hnt!r})"
             if st.index is not None:
                 s += f"[{st.index}]"
             parts.append(s)
@@ -87,10 +88,10 @@ class Locator:
     ) -> "Locator":
         """Filter the current step's matched elements by substring inclusion/exclusion (case-insensitive)."""
         steps = list(self._steps)
-        steps[-1] = steps[-1].clone(
-            has_text=has_text if has_text is not None else steps[-1].has_text,
-            has_not_text=has_not_text if has_not_text is not None else steps[-1].has_not_text,
-        )
+        cur = steps[-1]
+        next_has = (*cur.has_text, has_text) if has_text is not None else cur.has_text
+        next_not = (*cur.has_not_text, has_not_text) if has_not_text is not None else cur.has_not_text
+        steps[-1] = cur.clone(has_text=next_has, has_not_text=next_not)
         return Locator(self._tab, steps)
 
     @property
@@ -112,11 +113,11 @@ class Locator:
     @staticmethod
     def _apply_step_filters(nodes: List[Any], step: _Step) -> List[Any]:
         filtered = nodes
-        if step.has_text is not None:
-            needle = step.has_text.lower()
+        for ht in step.has_text:
+            needle = ht.lower()
             filtered = [n for n in filtered if needle in (n.text or "").lower()]
-        if step.has_not_text is not None:
-            needle = step.has_not_text.lower()
+        for hnt in step.has_not_text:
+            needle = hnt.lower()
             filtered = [n for n in filtered if needle not in (n.text or "").lower()]
         if step.index is not None:
             try:
@@ -338,7 +339,7 @@ class Locator:
 
     async def screenshot(
         self,
-        file_path: Optional[str] = None,
+        file_path: Optional[Union[str, os.PathLike[str]]] = None,
         timeout_ms: int = 10000,
     ) -> bytes:
         return await self._run_with_retry(timeout_ms, lambda el: el.screenshot(file_path))

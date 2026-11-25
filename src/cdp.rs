@@ -1,11 +1,11 @@
 // src/cdp.rs — Rust 2021, tokio + tokio-tungstenite: single browser-level CDP WebSocket with flattened session multiplexing
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Notify};
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 
@@ -28,6 +28,8 @@ pub struct CdpConnection {
     outgoing_tx: mpsc::UnboundedSender<String>,
     pending: Pending,
     event_tx: broadcast::Sender<CdpEvent>,
+    closed: Arc<AtomicBool>,
+    close_notify: Arc<Notify>,
 }
 
 impl CdpConnection {
@@ -48,18 +50,38 @@ impl CdpConnection {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let pending_recv = Arc::clone(&pending);
         let event_tx_clone = event_tx.clone();
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_recv = Arc::clone(&closed);
+        let close_notify = Arc::new(Notify::new());
+        let close_write = Arc::clone(&close_notify);
+        let close_read = Arc::clone(&close_notify);
 
         tokio::spawn(async move {
-            while let Some(msg) = outgoing_rx.recv().await {
-                if write.send(Message::Text(msg.into())).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    _ = close_write.notified() => break,
+                    msg = outgoing_rx.recv() => {
+                        match msg {
+                            Some(m) => {
+                                if write.send(Message::Text(m.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
                 }
             }
             let _ = write.close().await;
         });
 
         tokio::spawn(async move {
-            while let Some(Ok(msg)) = read.next().await {
+            loop {
+                let item = tokio::select! {
+                    _ = close_read.notified() => break,
+                    next = read.next() => next,
+                };
+                let Some(Ok(msg)) = item else { break };
                 match msg {
                     Message::Text(text) => {
                         let Ok(json) = serde_json::from_str::<Value>(&text) else { continue };
@@ -89,7 +111,13 @@ impl CdpConnection {
                     _ => {}
                 }
             }
-            // Socket closed: fail all in-flight callers so nothing hangs
+            // Socket closed: mark closed, fail all in-flight callers, and notify waiters
+            closed_recv.store(true, Ordering::SeqCst);
+            let _ = event_tx_clone.send(CdpEvent {
+                session_id: None,
+                method: "_internal.wsClosed".to_string(),
+                params: Value::Null,
+            });
             pending_recv.lock().await.clear();
         });
 
@@ -98,7 +126,20 @@ impl CdpConnection {
             outgoing_tx,
             pending,
             event_tx,
+            closed,
+            close_notify,
         }))
+    }
+
+    /// Returns `true` while the underlying browser CDP WebSocket is open.
+    pub fn is_open(&self) -> bool {
+        !self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Immediately closes the underlying CDP WebSocket so Chromium cleans up sessions/Fetch on this connection.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.close_notify.notify_waiters();
     }
 
     pub async fn call_raw(
@@ -180,6 +221,7 @@ enum SessionFilter {
     Session(String),
     Popups {
         opener_target_id: String,
+        parent_context_id: Option<String>,
         parent_session_id: String,
     },
 }
@@ -210,6 +252,7 @@ impl SessionEventRx {
                     }
                     SessionFilter::Popups {
                         opener_target_id,
+                        parent_context_id,
                         parent_session_id,
                     } => {
                         if ev.method == "Target.detachedFromTarget"
@@ -222,8 +265,22 @@ impl SessionEventRx {
                             let opener = ev
                                 .params
                                 .pointer("/targetInfo/openerId")
-                                .and_then(|v| v.as_str());
-                            if opener == Some(opener_target_id.as_str()) {
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty());
+                            let ev_ctx = ev
+                                .params
+                                .pointer("/targetInfo/browserContextId")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty());
+                            // Match explicit openerId OR implicit rel="noopener" (<a target="_blank">) in same context
+                            let matched = match opener {
+                                Some(op) => op == opener_target_id.as_str(),
+                                None => match parent_context_id.as_deref() {
+                                    Some(pc) => ev_ctx == Some(pc),
+                                    None => true,
+                                },
+                            };
+                            if matched {
                                 return Ok((ev.method, ev.params));
                             }
                         }
@@ -255,12 +312,17 @@ impl CdpSession {
         }
     }
 
-    /// Subscribes to browser-level `Target.targetCreated` popup events opened by `opener_target_id`.
-    pub fn subscribe_popups(&self, opener_target_id: String) -> SessionEventRx {
+    /// Subscribes to popup events opened by `opener_target_id` (including implicit `rel="noopener"` `<a target="_blank">`).
+    pub fn subscribe_popups(
+        &self,
+        opener_target_id: String,
+        parent_context_id: Option<String>,
+    ) -> SessionEventRx {
         SessionEventRx {
             rx: self.conn.subscribe(),
             filter: SessionFilter::Popups {
                 opener_target_id,
+                parent_context_id,
                 parent_session_id: self.session_id.clone(),
             },
         }

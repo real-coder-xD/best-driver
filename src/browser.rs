@@ -2,6 +2,8 @@
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,13 +19,14 @@ struct VersionInfo {
     web_socket_debugger_url: Option<String>,
 }
 
-/// Pure-Tokio loopback HTTP GET `/json/version` — parses Content-Length directly (never hangs on HTTP/1.1 keep-alive).
-async fn fetch_browser_ws_url(port: u16) -> Option<String> {
-    let fut = async {
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+/// Pure-Tokio HTTP GET `/json/version` — parses Content-Length directly (never hangs on HTTP/1.1 keep-alive).
+async fn fetch_browser_ws_url_host(host: &str, port: u16) -> Option<String> {
+    let host = host.to_string();
+    let fut = async move {
+        let mut stream = TcpStream::connect((host.as_str(), port)).await.ok()?;
         let req = format!(
-            "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-            port
+            "GET /json/version HTTP/1.1\r\nHost: {}:{}\r\nConnection: close\r\n\r\n",
+            host, port
         );
         stream.write_all(req.as_bytes()).await.ok()?;
 
@@ -68,7 +71,64 @@ async fn fetch_browser_ws_url(port: u16) -> Option<String> {
         let info: VersionInfo = serde_json::from_str(&body[start..=end]).ok()?;
         info.web_socket_debugger_url
     };
-    tokio::time::timeout(Duration::from_secs(2), fut).await.ok().flatten()
+    tokio::time::timeout(Duration::from_secs(3), fut).await.ok().flatten()
+}
+
+async fn fetch_browser_ws_url(port: u16) -> Option<String> {
+    fetch_browser_ws_url_host("127.0.0.1", port).await
+}
+
+/// Parses a port number, `host:port`, or `http://host:port` endpoint into `(host, port)`.
+pub fn parse_cdp_host_port(endpoint: &str) -> Option<(String, u16)> {
+    let s = endpoint.trim();
+    if let Ok(p) = s.parse::<u16>() {
+        return Some(("127.0.0.1".to_string(), p));
+    }
+    let stripped = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
+    let authority = stripped.split('/').next().unwrap_or("");
+    let (host, port_str) = authority.rsplit_once(':')?;
+    let port = port_str.parse::<u16>().ok()?;
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port))
+}
+
+/// Resolves a CDP endpoint (`ws://...`, port `"9222"`, `"127.0.0.1:9222"`, or `"http://127.0.0.1:9222"`)
+/// into `(browser_ws_url, port)`.
+pub async fn resolve_cdp_ws_url(endpoint: &str) -> DriverResult<(String, u16)> {
+    let trimmed = endpoint.trim();
+    if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        let authority = trimmed
+            .split("://")
+            .nth(1)
+            .unwrap_or("")
+            .split('/')
+            .next()
+            .unwrap_or("");
+        let port = authority
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .unwrap_or(0);
+        return Ok((trimmed.to_string(), port));
+    }
+    let (host, port) = parse_cdp_host_port(trimmed).ok_or_else(|| {
+        DriverError::InvalidInput(format!(
+            "Endpoint CDP không hợp lệ '{}'; hỗ trợ port (9222), http://host:port, hoặc ws://...",
+            endpoint
+        ))
+    })?;
+    let ws_url = fetch_browser_ws_url_host(&host, port).await.ok_or_else(|| {
+        DriverError::Connection(format!(
+            "Không lấy được /json/version từ Chromium tại {}:{}",
+            host, port
+        ))
+    })?;
+    Ok((ws_url, port))
 }
 
 /// Builds `Emulation.setUserAgentOverride` params when Chrome reports `HeadlessChrome/`, aligning UA + Sec-CH-UA.
@@ -192,9 +252,10 @@ pub struct BrowserProcess {
     pub child: Child,
     pub port: u16,
     pub ws_url: String,
-    // Held for RAII: the temp profile is removed when the process struct drops
+    // Held for RAII: the temp profile is removed when the process struct drops unless detached
     _temp_dir: Option<TempDir>,
     pub user_data_dir: PathBuf,
+    detached: Arc<AtomicBool>,
 }
 
 impl BrowserProcess {
@@ -256,6 +317,7 @@ impl BrowserProcess {
         user_data_dir: Option<String>,
         browser_path: Option<String>,
         extra_args: Option<Vec<String>>,
+        detached: Arc<AtomicBool>,
     ) -> DriverResult<Self> {
         let binary = Self::find_chrome(browser_path.as_deref())?;
         let port = Self::get_free_port();
@@ -334,6 +396,7 @@ impl BrowserProcess {
             ws_url: browser_ws_url,
             _temp_dir: temp_dir,
             user_data_dir: data_dir,
+            detached,
         })
     }
 
@@ -364,7 +427,14 @@ impl BrowserProcess {
 
 impl Drop for BrowserProcess {
     fn drop(&mut self) {
-        self.kill();
+        if self.detached.load(Ordering::SeqCst) {
+            // Preserve the profile directory on disk while Chromium keeps running independently
+            if let Some(td) = self._temp_dir.take() {
+                let _ = td.keep();
+            }
+        } else {
+            self.kill();
+        }
     }
 }
 
@@ -443,5 +513,14 @@ mod tests {
                 "--lang=en-US".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parse_cdp_host_port_handles_all_formats() {
+        assert_eq!(parse_cdp_host_port("9222"), Some(("127.0.0.1".to_string(), 9222)));
+        assert_eq!(parse_cdp_host_port("http://127.0.0.1:9222"), Some(("127.0.0.1".to_string(), 9222)));
+        assert_eq!(parse_cdp_host_port("http://localhost:9333/json/version"), Some(("localhost".to_string(), 9333)));
+        assert_eq!(parse_cdp_host_port("127.0.0.1:9444"), Some(("127.0.0.1".to_string(), 9444)));
+        assert_eq!(parse_cdp_host_port("not-valid"), None);
     }
 }

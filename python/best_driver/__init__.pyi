@@ -7,6 +7,7 @@ Smart Locator syntax accepted across `Tab` and `Element` queries:
 - Attribute shorthand: `@name=username`, `@placeholder=Search`, `@disabled`
 """
 
+import os
 from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Literal, Optional, Sequence, TypedDict, Union, overload
 
 if TYPE_CHECKING:
@@ -16,11 +17,42 @@ else:
     HttpTlsAsyncSession = Any
     HttpTlsSession = Any
 
+PathLike = Union[str, os.PathLike[str]]
 WaitUntil = Literal["load", "domcontentloaded", "networkidle", "none", "commit"]
 MouseButton = Literal["left", "right", "middle"]
 ImageFormat = Literal["png", "jpeg", "jpg", "webp"]
 RouteStage = Literal["request", "response"]
 LocatorState = Literal["attached", "visible", "hidden", "detached"]
+WindowState = Literal["normal", "minimized", "maximized", "fullscreen"]
+PermissionName = Literal[
+    "geolocation",
+    "notifications",
+    "clipboard-read",
+    "clipboard-write",
+    "camera",
+    "microphone",
+    "midi",
+    "midi-sysex",
+    "background-sync",
+]
+
+
+class WindowBounds(TypedDict):
+    """OS browser window geometry and state returned by `Tab.get_window_bounds()`."""
+
+    window_id: int
+    left: Optional[int]
+    top: Optional[int]
+    width: Optional[int]
+    height: Optional[int]
+    state: WindowState
+
+
+class LoadedStorageState(TypedDict):
+    """Summary counts returned by `Tab.load_storage_state()`."""
+
+    cookies: int
+    local_storage: int
 
 
 class ViewportSize(TypedDict, total=False):
@@ -50,6 +82,8 @@ SpecialKey = Literal[
     "Backspace",
     "Delete",
     "Del",
+    "Insert",
+    "Ins",
     "Space",
     "ArrowUp",
     "Up",
@@ -63,6 +97,26 @@ SpecialKey = Literal[
     "End",
     "PageUp",
     "PageDown",
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5",
+    "F6",
+    "F7",
+    "F8",
+    "F9",
+    "F10",
+    "F11",
+    "F12",
+    "Control+a",
+    "Control+c",
+    "Control+v",
+    "Control+x",
+    "Control+z",
+    "Control+y",
+    "Control+Shift+z",
+    "Shift+Enter",
 ]
 
 
@@ -275,7 +329,7 @@ class Element:
         """Select a `<select>` option by `value` or visible label."""
         ...
 
-    async def screenshot(self, file_path: Optional[str] = None) -> bytes:
+    async def screenshot(self, file_path: Optional[PathLike] = None) -> bytes:
         """Capture PNG screenshot clipped to this element; optionally save to `file_path`."""
         ...
 
@@ -315,13 +369,13 @@ class Tab:
         """Return all frames in the current page's frame tree."""
         ...
 
-    async def set_download_dir(self, download_dir: str) -> str:
+    async def set_download_dir(self, download_dir: PathLike) -> str:
         """Configure Chromium's download directory and return the resolved absolute path."""
         ...
 
     async def wait_for_download(
         self,
-        download_dir: str,
+        download_dir: PathLike,
         timeout_ms: int = 30000,
     ) -> DownloadInfo:
         """Configure `download_dir` and await completion of the next file download."""
@@ -568,7 +622,7 @@ class Tab:
         ...
 
     async def press_key(self, key: Union[SpecialKey, str]) -> None:
-        """Dispatch a special key (`"Enter"`, `"Tab"`, `"Escape"`, `"Backspace"`, `"ArrowDown"`, ...)."""
+        """Dispatch a single key or modifier chord (`"Enter"`, `"Escape"`, `"F5"`, `"Control+a"`, `"Ctrl+Shift+Z"`, `"Shift+Enter"`)."""
         ...
 
     # Forms
@@ -592,7 +646,7 @@ class Tab:
     async def upload_file(
         self,
         selector: str,
-        files: Union[str, Sequence[str]],
+        files: Union[PathLike, Sequence[PathLike]],
         timeout_ms: int = 10000,
     ) -> None:
         """Attach one or more local files to an `<input type="file">` without OS dialogs."""
@@ -665,6 +719,29 @@ class Tab:
         """Grant geolocation permission and spoof coordinates."""
         ...
 
+    async def grant_permissions(
+        self,
+        permissions: Sequence[Union[PermissionName, str]],
+        origin: Optional[str] = None,
+    ) -> None:
+        """Grant browser permissions (`"notifications"`, `"clipboard-read"`, `"clipboard-write"`, `"geolocation"`, `"camera"`, `"microphone"`)."""
+        ...
+
+    async def get_window_bounds(self) -> WindowBounds:
+        """Return OS browser window bounds and state (`window_id`, `left`, `top`, `width`, `height`, `state`)."""
+        ...
+
+    async def set_window_bounds(
+        self,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        left: Optional[int] = None,
+        top: Optional[int] = None,
+        state: Optional[WindowState] = None,
+    ) -> None:
+        """Resize, reposition, or change the OS window state (`normal`, `minimized`, `maximized`, `fullscreen`)."""
+        ...
+
     # Network
     async def set_extra_headers(self, headers: dict[str, str]) -> None:
         """Attach extra HTTP headers to every outgoing request in this tab."""
@@ -722,11 +799,11 @@ class Tab:
         """Clear all cookies in the browser profile."""
         ...
 
-    async def save_cookies(self, path: str) -> int:
+    async def save_cookies(self, path: PathLike) -> int:
         """Serialize all browser cookies to a JSON file and return cookie count."""
         ...
 
-    async def load_cookies(self, path: str) -> int:
+    async def load_cookies(self, path: PathLike) -> int:
         """Load and inject cookies from a JSON file and return cookie count."""
         ...
 
@@ -777,7 +854,7 @@ class Tab:
     # Capture & raw CDP
     async def screenshot(
         self,
-        file_path: Optional[str] = None,
+        file_path: Optional[PathLike] = None,
         full_page: bool = False,
         format: ImageFormat = "png",
         quality: Optional[int] = None,
@@ -788,7 +865,7 @@ class Tab:
 
     async def pdf(
         self,
-        file_path: Optional[str] = None,
+        file_path: Optional[PathLike] = None,
         landscape: bool = False,
     ) -> bytes:
         """Render the current page to PDF bytes (optionally saving to `file_path`)."""
@@ -836,8 +913,15 @@ class Tab:
         """Capture the live Chromium HTTP/TLS identity (`impersonate`, UA, `Sec-CH-UA*`, `header_order`, `proxy`)."""
         ...
 
-    async def storage_state(self, path: Optional[str] = None) -> StorageState:
-        """Export all CDP cookies (including `HttpOnly`) and live browser headers in `http_tls`/Playwright format."""
+    async def storage_state(self, path: Optional[PathLike] = None) -> StorageState:
+        """Export all CDP cookies (including `HttpOnly`), active origin `localStorage`, and live browser headers in `http_tls`/Playwright format."""
+        ...
+
+    async def load_storage_state(
+        self,
+        state_or_path: Union[PathLike, StorageState, dict[str, Any]],
+    ) -> LoadedStorageState:
+        """Restore cookies (context-scoped) and matching-origin `localStorage` from a `storage_state` dict, `str`, or `PathLike` JSON path."""
         ...
 
     @overload
@@ -880,7 +964,7 @@ class Tab:
         """Start recording HAR 1.2 network transactions on this tab."""
         ...
 
-    async def export_har(self, path: Optional[str] = None) -> dict[str, Any]:
+    async def export_har(self, path: Optional[PathLike] = None) -> dict[str, Any]:
         """Return recorded HAR 1.2 data (optionally writing pretty JSON to `path`)."""
         ...
 
@@ -928,8 +1012,13 @@ class Tab:
 class EventStream:
     """Low-level Tokio-backed filtered CDP event stream."""
 
-    async def next(self, timeout_ms: Optional[int] = None) -> Optional[dict[str, Any]]: ...
-    def close(self) -> None: ...
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[dict[str, Any]]:
+        """Await the next matching raw CDP event (`{"method", "params"}`), or `None` on timeout/close."""
+        ...
+
+    def close(self) -> None:
+        """Close this stream immediately so pending `next()` waiters return `None`."""
+        ...
 
 
 class Route:
@@ -1011,9 +1100,17 @@ class HarRecorder:
 
     entries: list[dict[str, Any]]
 
-    def start(self) -> None: ...
-    async def stop(self) -> None: ...
-    def to_har(self) -> dict[str, Any]: ...
+    def start(self) -> None:
+        """Start the background HAR capture task if not already running."""
+        ...
+
+    async def stop(self) -> None:
+        """Stop background HAR capture and close the underlying CDP event stream."""
+        ...
+
+    def to_har(self) -> dict[str, Any]:
+        """Return a snapshot dictionary conforming to HAR 1.2 (`{"log": ...}`)."""
+        ...
 
 
 RouteHandler = Callable[[Route], Union[None, Awaitable[None]]]
@@ -1060,8 +1157,14 @@ class StreamedResponse:
 class RequestStream(AsyncIterator[StreamedRequest]):
     """Async stream of outgoing HTTP requests (`async with` + `async for`)."""
 
-    async def next(self, timeout_ms: Optional[int] = None) -> Optional[StreamedRequest]: ...
-    def close(self) -> None: ...
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[StreamedRequest]:
+        """Await the next matching outgoing HTTP request, or `None` on timeout/close."""
+        ...
+
+    def close(self) -> None:
+        """Close this request stream."""
+        ...
+
     def __aiter__(self) -> RequestStream: ...
     async def __anext__(self) -> StreamedRequest: ...
     async def __aenter__(self) -> RequestStream: ...
@@ -1071,8 +1174,14 @@ class RequestStream(AsyncIterator[StreamedRequest]):
 class ResponseStream(AsyncIterator[StreamedResponse]):
     """Async stream of incoming HTTP responses (`async with` + `async for`)."""
 
-    async def next(self, timeout_ms: Optional[int] = None) -> Optional[StreamedResponse]: ...
-    def close(self) -> None: ...
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[StreamedResponse]:
+        """Await the next matching HTTP response, or `None` on timeout/close."""
+        ...
+
+    def close(self) -> None:
+        """Close this response stream."""
+        ...
+
     def __aiter__(self) -> ResponseStream: ...
     async def __anext__(self) -> StreamedResponse: ...
     async def __aenter__(self) -> ResponseStream: ...
@@ -1114,9 +1223,18 @@ class CrashEvent:
 class ConsoleStream(AsyncIterator[ConsoleMessage]):
     """Opt-in async stream of JS console messages (`Runtime.enable` while active, `Runtime.disable` on exit)."""
 
-    async def next(self, timeout_ms: Optional[int] = None) -> Optional[ConsoleMessage]: ...
-    def close(self) -> None: ...
-    async def aclose(self) -> None: ...
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[ConsoleMessage]:
+        """Await the next matching `console.*` message, or `None` on timeout/close."""
+        ...
+
+    def close(self) -> None:
+        """Close the local event stream synchronously (prefer `await aclose()` or `async with` to disable `Runtime`)."""
+        ...
+
+    async def aclose(self) -> None:
+        """Close the stream and release the tab's refcounted `Runtime.enable` state."""
+        ...
+
     def __aiter__(self) -> ConsoleStream: ...
     async def __anext__(self) -> ConsoleMessage: ...
     async def __aenter__(self) -> ConsoleStream: ...
@@ -1126,9 +1244,18 @@ class ConsoleStream(AsyncIterator[ConsoleMessage]):
 class PageErrorStream(AsyncIterator[PageError]):
     """Opt-in async stream of uncaught JS page errors (`Runtime.enable` while active, `Runtime.disable` on exit)."""
 
-    async def next(self, timeout_ms: Optional[int] = None) -> Optional[PageError]: ...
-    def close(self) -> None: ...
-    async def aclose(self) -> None: ...
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[PageError]:
+        """Await the next uncaught JavaScript exception or unhandled rejection, or `None` on timeout/close."""
+        ...
+
+    def close(self) -> None:
+        """Close the local event stream synchronously (prefer `await aclose()` or `async with` to disable `Runtime`)."""
+        ...
+
+    async def aclose(self) -> None:
+        """Close the stream and release the tab's refcounted `Runtime.enable` state."""
+        ...
+
     def __aiter__(self) -> PageErrorStream: ...
     async def __anext__(self) -> PageError: ...
     async def __aenter__(self) -> PageErrorStream: ...
@@ -1138,8 +1265,14 @@ class PageErrorStream(AsyncIterator[PageError]):
 class CrashStream(AsyncIterator[CrashEvent]):
     """Stealth-safe async stream of renderer crash events (`Inspector.targetCrashed`)."""
 
-    async def next(self, timeout_ms: Optional[int] = None) -> Optional[CrashEvent]: ...
-    def close(self) -> None: ...
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[CrashEvent]:
+        """Await the next renderer crash event for this tab, or `None` on timeout/close."""
+        ...
+
+    def close(self) -> None:
+        """Close this crash stream."""
+        ...
+
     def __aiter__(self) -> CrashStream: ...
     async def __anext__(self) -> CrashEvent: ...
     async def __aenter__(self) -> CrashStream: ...
@@ -1149,8 +1282,14 @@ class CrashStream(AsyncIterator[CrashEvent]):
 class PopupStream(AsyncIterator[Tab]):
     """Stealth-safe async stream of popup `Tab`s opened by a parent `Tab`."""
 
-    async def next(self, timeout_ms: Optional[int] = None) -> Optional[Tab]: ...
-    def close(self) -> None: ...
+    async def next(self, timeout_ms: Optional[int] = None) -> Optional[Tab]:
+        """Await the next popup `Tab` opened by this tab, or `None` on timeout/close."""
+        ...
+
+    def close(self) -> None:
+        """Close this popup stream."""
+        ...
+
     def __aiter__(self) -> PopupStream: ...
     async def __anext__(self) -> Tab: ...
     async def __aenter__(self) -> PopupStream: ...
@@ -1163,7 +1302,10 @@ class PopupExpectation:
     popup: Optional[Tab]
 
     @property
-    def value(self) -> Awaitable[Tab]: ...
+    def value(self) -> Awaitable[Tab]:
+        """Awaitable resolving to the captured popup `Tab`."""
+        ...
+
     async def __aenter__(self) -> PopupExpectation: ...
     async def __aexit__(self, *args: Any) -> bool: ...
     def __await__(self) -> Any: ...
@@ -1182,7 +1324,7 @@ class Locator:
         has_text: Optional[str] = None,
         has_not_text: Optional[str] = None,
     ) -> Locator:
-        """Filter matched elements at the current step by substring inclusion/exclusion."""
+        """Filter matched elements at the current step by substring inclusion/exclusion (chainable)."""
         ...
 
     @property
@@ -1196,41 +1338,121 @@ class Locator:
         ...
 
     def nth(self, index: int) -> Locator:
-        """Select the `index`-th match at the current step."""
+        """Select the `index`-th match (supports negative indexing) at the current step."""
         ...
 
-    async def element(self, timeout_ms: int = 10000) -> Optional[Element]: ...
-    async def all(self, timeout_ms: int = 10000) -> list[Element]: ...
-    async def count(self) -> int: ...
-    async def exists(self) -> bool: ...
-    async def is_visible(self) -> bool: ...
-    async def is_enabled(self) -> bool: ...
-    async def is_checked(self) -> bool: ...
-    async def wait_for(self, timeout_ms: int = 10000, state: LocatorState = "visible") -> None: ...
-    async def wait_for_hidden(self, timeout_ms: int = 10000) -> None: ...
+    async def element(self, timeout_ms: int = 10000) -> Optional[Element]:
+        """Resolve and return the first matching `Element` handle, or `None` on timeout."""
+        ...
+
+    async def all(self, timeout_ms: int = 10000) -> list[Element]:
+        """Wait up to `timeout_ms` for matches and return all resolved `Element` handles."""
+        ...
+
+    async def count(self) -> int:
+        """Return the current number of matching elements without waiting."""
+        ...
+
+    async def exists(self) -> bool:
+        """Return `True` if at least one element currently matches."""
+        ...
+
+    async def is_visible(self) -> bool:
+        """Return `True` if the first matched element has visible computed style and non-zero box."""
+        ...
+
+    async def is_enabled(self) -> bool:
+        """Return `True` if the first matched element is not disabled."""
+        ...
+
+    async def is_checked(self) -> bool:
+        """Return `True` if the first matched checkbox/radio is checked."""
+        ...
+
+    async def wait_for(self, timeout_ms: int = 10000, state: LocatorState = "visible") -> None:
+        """Wait until the locator reaches `state` (`"visible"`, `"attached"`, `"hidden"`, or `"detached"`)."""
+        ...
+
+    async def wait_for_hidden(self, timeout_ms: int = 10000) -> None:
+        """Wait until the matched element is hidden or detached from the DOM."""
+        ...
+
     async def click(
         self,
         button: MouseButton = "left",
         click_count: int = 1,
         timeout_ms: int = 10000,
-    ) -> None: ...
-    async def double_click(self, timeout_ms: int = 10000) -> None: ...
-    async def right_click(self, timeout_ms: int = 10000) -> None: ...
-    async def hover(self, timeout_ms: int = 10000) -> None: ...
-    async def human_type(self, text: str, clear: bool = False, timeout_ms: int = 10000) -> None: ...
-    async def fill(self, text: str, timeout_ms: int = 10000) -> None: ...
-    async def clear(self, timeout_ms: int = 10000) -> None: ...
-    async def check(self, timeout_ms: int = 10000) -> None: ...
-    async def uncheck(self, timeout_ms: int = 10000) -> None: ...
-    async def select_option(self, value: str, timeout_ms: int = 10000) -> None: ...
-    async def press_key(self, key: Union[SpecialKey, str], timeout_ms: int = 10000) -> None: ...
-    async def text(self, timeout_ms: int = 10000) -> str: ...
-    async def attr(self, name: str, timeout_ms: int = 10000) -> Optional[str]: ...
-    async def value(self, timeout_ms: int = 10000) -> Optional[str]: ...
-    async def inner_html(self, timeout_ms: int = 10000) -> Optional[str]: ...
-    async def outer_html(self, timeout_ms: int = 10000) -> str: ...
-    async def scroll_into_view(self, timeout_ms: int = 10000) -> None: ...
-    async def screenshot(self, file_path: Optional[str] = None, timeout_ms: int = 10000) -> bytes: ...
+    ) -> None:
+        """Re-resolve and click along a Cubic Bézier trajectory, retrying transient stale DOM errors."""
+        ...
+
+    async def double_click(self, timeout_ms: int = 10000) -> None:
+        """Re-resolve and double-click the matched element."""
+        ...
+
+    async def right_click(self, timeout_ms: int = 10000) -> None:
+        """Re-resolve and right-click the matched element."""
+        ...
+
+    async def hover(self, timeout_ms: int = 10000) -> None:
+        """Re-resolve and hover over the matched element."""
+        ...
+
+    async def human_type(self, text: str, clear: bool = False, timeout_ms: int = 10000) -> None:
+        """Re-resolve and type `text` with biological keystroke cadence."""
+        ...
+
+    async def fill(self, text: str, timeout_ms: int = 10000) -> None:
+        """Re-resolve, clear, and insert `text` immediately via CDP `Input.insertText`."""
+        ...
+
+    async def clear(self, timeout_ms: int = 10000) -> None:
+        """Re-resolve and clear input text through native selection + Backspace."""
+        ...
+
+    async def check(self, timeout_ms: int = 10000) -> None:
+        """Re-resolve and ensure the matched checkbox/radio is checked."""
+        ...
+
+    async def uncheck(self, timeout_ms: int = 10000) -> None:
+        """Re-resolve and ensure the matched checkbox is unchecked."""
+        ...
+
+    async def select_option(self, value: str, timeout_ms: int = 10000) -> None:
+        """Re-resolve and select a `<select>` option by `value` or visible label."""
+        ...
+
+    async def press_key(self, key: Union[SpecialKey, str], timeout_ms: int = 10000) -> None:
+        """Re-resolve, focus via click, and dispatch a key or modifier chord (`"Enter"`, `"Control+a"`, etc.)."""
+        ...
+
+    async def text(self, timeout_ms: int = 10000) -> str:
+        """Resolve the matched element and return its trimmed visible text."""
+        ...
+
+    async def attr(self, name: str, timeout_ms: int = 10000) -> Optional[str]:
+        """Re-resolve and read attribute `name` from the matched element."""
+        ...
+
+    async def value(self, timeout_ms: int = 10000) -> Optional[str]:
+        """Resolve the matched form control and return its current `.value`."""
+        ...
+
+    async def inner_html(self, timeout_ms: int = 10000) -> Optional[str]:
+        """Re-resolve and read `innerHTML` of the matched element."""
+        ...
+
+    async def outer_html(self, timeout_ms: int = 10000) -> str:
+        """Re-resolve and read `outerHTML` of the matched element."""
+        ...
+
+    async def scroll_into_view(self, timeout_ms: int = 10000) -> None:
+        """Re-resolve and center the matched element in the viewport."""
+        ...
+
+    async def screenshot(self, file_path: Optional[PathLike] = None, timeout_ms: int = 10000) -> bytes:
+        """Re-resolve and capture a PNG screenshot clipped to this element (optionally saving to `file_path`)."""
+        ...
 
 
 class BrowserContext:
@@ -1303,7 +1525,15 @@ class Browser:
         ...
 
     async def is_alive(self) -> bool:
-        """Return `True` if the Chromium child process is still running."""
+        """Return `True` if the Chromium process / CDP WebSocket is still running."""
+        ...
+
+    def detach(self) -> None:
+        """Detach Chromium from lifecycle cleanup so it stays open after `stop()`, `async with`, or process exit."""
+        ...
+
+    async def wait_until_closed(self, poll_ms: int = 250) -> None:
+        """Block asynchronously until the Chromium window is closed or the CDP WebSocket disconnects."""
         ...
 
     async def main_tab(self) -> Tab:
@@ -1352,10 +1582,11 @@ class Browser:
 
 async def start(
     headless: bool = False,
-    user_data_dir: Optional[str] = None,
-    browser_path: Optional[str] = None,
+    user_data_dir: Optional[PathLike] = None,
+    browser_path: Optional[PathLike] = None,
     extra_args: Optional[Sequence[str]] = None,
     proxy: Optional[str] = None,
+    keep_open: bool = False,
 ) -> Browser:
     """Launch Chromium over a single flattened browser-level CDP WebSocket.
 
@@ -1365,6 +1596,49 @@ async def start(
         browser_path: Explicit path to Chrome/Brave/Edge/Chromium binary; auto-detected when `None`.
         extra_args: Additional Chromium command-line flags.
         proxy: Proxy URL (`"http://host:port"`, `"http://user:pass@host:port"`, `"socks5://host:port"`).
+        keep_open: Keep Chromium running independently after `stop()`, `async with`, or Python exit.
+    """
+    ...
+
+
+class CleanupReport(TypedDict):
+    """Structured statistics returned by `best_driver.cleanup()`."""
+
+    removed_dirs: list[str]
+    freed_bytes: int
+    killed_pids: list[int]
+    skipped_in_use: list[str]
+    skipped_recent: list[str]
+    errors: list[str]
+    dry_run: bool
+
+
+def cleanup(
+    *,
+    kill_orphans: bool = False,
+    min_age_seconds: float = 0.0,
+    exclude_dirs: Optional[Sequence[PathLike]] = None,
+    dry_run: bool = False,
+    temp_dir: Optional[PathLike] = None,
+) -> CleanupReport:
+    """Safely clean stale `best_driver_profile_*` temporary Chromium directories and optional orphan processes.
+
+    Never touches personal Chrome/Edge/Brave profiles or browsers owned by live scripts.
+    On Windows, atomically stages each directory before deletion so locked profiles are skipped
+    without partial-deletion corruption.
+    """
+    ...
+
+
+async def connect(
+    endpoint: Union[int, str],
+    proxy: Optional[str] = None,
+) -> Browser:
+    """Connect to an already-running Chromium instance over CDP without taking process ownership.
+
+    Args:
+        endpoint: DevTools port (`9222`), HTTP URL (`"http://127.0.0.1:9222"`), `host:port`, or full `"ws://..."` URL.
+        proxy: Optional proxy URL metadata for `tab.tls_session()` handoff.
     """
     ...
 
@@ -1404,6 +1678,7 @@ __all__ = [
     "Browser",
     "BrowserContext",
     "BrowserFingerprint",
+    "CleanupReport",
     "ConsoleMessage",
     "ConsoleStream",
     "Cookie",
@@ -1418,12 +1693,15 @@ __all__ = [
     "FrameInfo",
     "HarRecorder",
     "ImageFormat",
+    "LoadedStorageState",
     "Locator",
     "LocatorState",
     "MouseButton",
     "NetworkResponse",
     "PageError",
     "PageErrorStream",
+    "PathLike",
+    "PermissionName",
     "PopupExpectation",
     "PopupStream",
     "RequestStream",
@@ -1438,6 +1716,10 @@ __all__ = [
     "Tab",
     "ViewportSize",
     "WaitUntil",
+    "WindowBounds",
+    "WindowState",
+    "cleanup",
+    "connect",
     "start",
     "sync_from_tls",
     "tls_session",

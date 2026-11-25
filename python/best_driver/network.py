@@ -8,6 +8,7 @@ import datetime as _dt
 import fnmatch
 import inspect
 import json as _json
+import os
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlsplit
 
@@ -515,7 +516,12 @@ class HarRecorder:
         self._tab = tab
         self._include_bodies = include_bodies
         self._stream = tab._event_stream(
-            ["Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"]
+            [
+                "Network.requestWillBeSent",
+                "Network.responseReceived",
+                "Network.loadingFinished",
+                "Network.loadingFailed",
+            ]
         )
         self._pending: Dict[str, Dict[str, Any]] = {}
         self.entries: List[Dict[str, Any]] = []
@@ -574,6 +580,8 @@ class HarRecorder:
                         {"name": str(k), "value": str(v)}
                         for k, v in (resp.get("headers") or {}).items()
                     ]
+                elif method == "Network.loadingFailed":
+                    self._pending.pop(rid, None)
                 elif method == "Network.loadingFinished":
                     rec = self._pending.pop(rid, None)
                     if rec is None:
@@ -635,7 +643,7 @@ class HarRecorder:
         return {
             "log": {
                 "version": "1.2",
-                "creator": {"name": "best-driver", "version": "0.3.2"},
+                "creator": {"name": "best-driver", "version": "0.3.3"},
                 "entries": list(self.entries),
             }
         }
@@ -714,16 +722,19 @@ async def start_har(tab: Any, include_bodies: bool = True) -> HarRecorder:
     return rec
 
 
-async def export_har(tab: Any, path: Optional[str] = None) -> Dict[str, Any]:
+async def export_har(
+    tab: Any,
+    path: Optional[Union[str, os.PathLike[str]]] = None,
+) -> Dict[str, Any]:
     """Export recorded HAR 1.2 dictionary (and optionally write to `path`)."""
     rec = _HAR_RECORDERS.get(tab.session_id)
     har = (
         rec.to_har()
         if rec is not None
-        else {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.2"}, "entries": []}}
+        else {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.3"}, "entries": []}}
     )
     if path is not None:
-        with open(path, "w", encoding="utf-8") as fh:
+        with open(os.fspath(path), "w", encoding="utf-8") as fh:
             _json.dump(har, fh, indent=2)
     return har
 
@@ -732,7 +743,7 @@ async def stop_har(tab: Any) -> Dict[str, Any]:
     """Stop HAR 1.2 recording on `tab` and return the captured HAR dictionary."""
     rec = _HAR_RECORDERS.pop(tab.session_id, None)
     if rec is None:
-        return {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.2"}, "entries": []}}
+        return {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.3"}, "entries": []}}
     await rec.stop()
     return rec.to_har()
 

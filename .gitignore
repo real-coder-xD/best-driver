@@ -11,6 +11,7 @@
 *.jpeg
 *.webp
 *.pdf
+!docs/assets/**
 
 # Python bytecode & cache
 __pycache__/

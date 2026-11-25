@@ -2,6 +2,30 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.3.3] - 2026-11-26
+
+### Added
+- **Keep-Open & Detach Lifecycle (`start(..., keep_open=True)`, `browser.detach()`, `browser.wait_until_closed()`)**:
+  - `start(..., keep_open=True)` and `browser.detach()` release Chromium from `stop()` / `async with` / `Drop` termination and preserve temporary profiles via `TempDir::keep()`, letting the browser stay open after Python exits.
+  - `await browser.wait_until_closed(poll_ms=250)` awaits browser shutdown cleanly (waking immediately on WebSocket close) for interactive headful workflows and manual login/debugging.
+- **Attach to Running Chromium (`await best_driver.connect(endpoint, proxy=None)`)**: Connects over flattened CDP to any already-running Chrome/Brave/Edge instance via port (`9222`), `http://127.0.0.1:9222`, `host:port`, or full `ws://...` URL without taking process ownership (never kills the external browser on disconnect).
+- **Conflict-Safe Temp Profile & Orphan Cleanup (`best_driver.cleanup(kill_orphans=False, min_age_seconds=0, exclude_dirs=None, dry_run=False)`)**: Safely removes stale `best_driver_profile_*` temp directories (returning `CleanupReport`), uses Windows atomic directory staging (`os.rename` before `rmtree`) and POSIX `SingletonLock` + live process/PPID tree inspection so active browsers owned by running scripts and personal Chrome profiles are never touched or partially corrupted.
+- **Modifier Keyboard Chords (`tab.press_key("Control+a")`, `"Ctrl+Shift+Z"`, `"Shift+Enter"`, `"F1"`–`"F12"`)**: Extended `press_key()` (and `Locator.press_key()`) with full CDP modifier bitmasks (`Alt`/`Control`/`Meta`/`Shift`) and cross-platform Blink editing commands (`selectAll`, `copy`, `cut`, `paste`, `undo`, `redo`).
+- **Symmetric Session State Restore (`tab.load_storage_state(state_or_path)`)**: Upgrades `tab.storage_state()` to capture active-origin `localStorage` under `origins` (Playwright format) and adds `tab.load_storage_state()` to restore both context-scoped cookies and matching-origin `localStorage` from a dict or JSON file.
+- **Permissions & OS Window Control (`tab.grant_permissions()`, `tab.get_window_bounds()`, `tab.set_window_bounds()`)**: Context-scoped `Browser.grantPermissions` (with Playwright aliases like `"clipboard-read"`, `"camera"`, `"microphone"`) and real OS window resize/maximize/minimize control for headful automation.
+
+### Changed
+- **Upgraded `best-driver[tls]` Minimum Floor to `http-tls>=1.3.0`**: Pulls in `http-tls 1.3.0`'s duplicate `User-Agent`/`Content-Type` wire-header fix, Real ECH (`sni=encrypted`), UDP QUIC HTTP/3, SOCKS5 UDP, DoH, RFC 6265 cookie/redirect hardening, and Pure Rust HTML5 CSS3/XPath/JSON extraction.
+
+### Fixed
+- **Pipelined Auto-Attach Arming (`<a target="_blank">` Deadlock Fix)**: `arm_target_once()` now pipelines `Emulation.setUserAgentOverride`, `Page.addScriptToEvaluateOnNewDocument`, `Page.enable`, `Target.setAutoAttach`, and `Runtime.runIfWaitingForDebugger` concurrently in strict wire order, eliminating the `waitForDebuggerOnStart` deadlock on `<a target="_blank">` (`canAccessOpener: false`) tabs and making `expect_popup()` capture real anchor clicks instantaneously.
+- **Sync `tab.auto_dialog()` Runtime Panic Fix**: `Tab` now captures its `tokio::runtime::Handle` at construction so synchronous `tab.auto_dialog(accept=True, prompt_text=...)` calls from Python spawn the dialog listener cleanly instead of panicking outside a Tokio runtime context.
+- **Isolated `BrowserContext` Download Scoping**: `set_download_dir()` and `wait_for_download()` now forward `browserContextId` to `Browser.setDownloadBehavior`, preventing Chromium from canceling downloads initiated inside an isolated `BrowserContext`.
+- **Full Closed `#shadow-root` Parity**: Extended automatic CDP pierced-DOM fallback (`pierce_find_ids`) across `wait_for`, `wait_for_hidden`, `attr`, `attr_all`, `value`, `html`, `text_all`, `focus`, `clear`, `fill`, `send_keys`, `human_type`, `hover`, `drag`, `select_option`, `check`/`uncheck`, `scroll_into_view`, `upload_file`, and `screenshot(selector=...)`, plus quote/bracket-aware CSS descendant splitting (`@placeholder=Enter full name`).
+- **Universal `os.PathLike` (`pathlib.Path`) Support**: Every file-path API (`start`, `screenshot`, `pdf`, `upload_file`, `save_cookies`, `load_cookies`, `storage_state`, `load_storage_state`, `set_download_dir`, `wait_for_download`, `export_har`, `Element.screenshot`, `Locator.screenshot`) now accepts `pathlib.Path` / `os.PathLike` seamlessly.
+- **Clean WebSocket Shutdown on Detached / `connect()` Handles**: `CdpConnection::close()` immediately terminates the CDP WebSocket on `browser.stop()` so `connect()`ed sessions tear down any active `Fetch.enable` interceptors cleanly without blocking the target browser.
+- **Cookie, Iframe, Locator & HAR Edge Cases**: Normalized case-insensitive `sameSite` and `SameSite=None` + `Secure` invariants in `set_cookies()`; added `*` glob matching to `wait_for_response()`; guarded `frame.close()` on in-process iframes against closing the parent tab; added iframe viewport offset to element screenshots; accumulated chained `Locator.filter()` predicates; evicted failed requests from `HarRecorder._pending` on `Network.loadingFailed`.
+
 ## [0.3.2] - 2026-11-21
 
 ### Added

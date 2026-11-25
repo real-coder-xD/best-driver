@@ -612,6 +612,52 @@ fn matches_simple_css(node: &serde_json::Value, sel: &str) -> bool {
     matched_any
 }
 
+/// Splits a CSS selector on descendant whitespace while preserving spaces inside `[...]` and quotes.
+fn split_css_descendants(css: &str) -> Vec<&str> {
+    let bytes = css.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escape = false;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if (in_single || in_double) && b == b'\\' {
+            escape = true;
+            continue;
+        }
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'[' if !in_single && !in_double => bracket_depth += 1,
+            b']' if !in_single && !in_double => bracket_depth = bracket_depth.saturating_sub(1),
+            b'(' if !in_single && !in_double => paren_depth += 1,
+            b')' if !in_single && !in_double => paren_depth = paren_depth.saturating_sub(1),
+            b' ' | b'\t' | b'\n' | b'\r'
+                if !in_single && !in_double && bracket_depth == 0 && paren_depth == 0 =>
+            {
+                let part = css[start..i].trim();
+                if !part.is_empty() && part != ">" {
+                    parts.push(part);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = css[start..].trim();
+    if !tail.is_empty() && tail != ">" {
+        parts.push(tail);
+    }
+    parts
+}
+
 fn find_pierced_single_branch(root: &serde_json::Value, s: &str, out: &mut Vec<i64>) {
     if s.is_empty() || is_xpath(s) {
         return;
@@ -663,8 +709,8 @@ fn find_pierced_single_branch(root: &serde_json::Value, s: &str, out: &mut Vec<i
 
     let css = branch_to_css(s).unwrap_or_else(|| s.to_string());
 
-    // Support whitespace-separated descendant selectors (e.g. `form input[type="checkbox"]`)
-    let parts: Vec<&str> = css.split_whitespace().filter(|p| *p != ">").collect();
+    // Support whitespace-separated descendant selectors (preserving quoted spaces inside `[...]`)
+    let parts = split_css_descendants(&css);
     if parts.is_empty() {
         return;
     }
@@ -862,6 +908,33 @@ mod tests {
         assert_eq!(
             find_pierced_backend_node_ids(&doc, "#missing, text:Verify you are human"),
             vec![20]
+        );
+    }
+
+    #[test]
+    fn pierced_css_preserves_spaces_inside_attribute_quotes() {
+        let dom = json!({
+            "nodeType": 9,
+            "children": [{
+                "nodeType": 1,
+                "localName": "div",
+                "attributes": ["id", "host"],
+                "backendNodeId": 10,
+                "shadowRoots": [{
+                    "nodeType": 11,
+                    "children": [{
+                        "nodeType": 1,
+                        "localName": "input",
+                        "attributes": ["placeholder", "Enter full name", "type", "text"],
+                        "backendNodeId": 42
+                    }]
+                }]
+            }]
+        });
+        assert_eq!(find_pierced_backend_node_ids(&dom, "@placeholder=Enter full name"), vec![42]);
+        assert_eq!(
+            find_pierced_backend_node_ids(&dom, "div input[placeholder=\"Enter full name\"]"),
+            vec![42]
         );
     }
 }

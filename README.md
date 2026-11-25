@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="https://raw.githubusercontent.com/real-coder-xD/best-driver/main/docs/assets/banner.jpg" alt="best-driver — Rust PyO3 + Tokio Undetected Chromium CDP Engine for Python" width="100%" />
+
 # `best-driver`
 
 **Undetected Rust-Powered Chromium Automation for Python**
@@ -16,7 +18,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](https://github.com/real-coder-xD/best-driver/blob/main/LICENSE)
 
 [Quickstart](#quickstart) · [http_tls Handoff](#synchronized-http_tls-session-handoff) · [Overview](#overview) · [Comparison](#best-driver-vs-patchright-nodriver-and-drissionpage) · [Installation](#installation) · [Locators & Shadow DOM](#smart-locators-and-shadow-dom) · [Elements](#element-handles) · [Iframes](#working-with-iframes)<br>
-[Network & Downloads](#network-interception-and-downloads) · [Sessions & Proxies](#cookies-storage-profiles-and-proxies) · [Input Physics](#biological-input-physics-and-forms) · [Stealth](#stealth-and-anti-detection-architecture) · [Errors & Typing](#error-handling-and-typing) · [API Reference](#api-reference) · [Architecture](#architecture-under-the-hood) · [FAQ](#frequently-asked-questions)
+[Network & Downloads](#network-interception-and-downloads) · [Sessions & Lifecycle](#cookies-storage-profiles-and-proxies) · [Popups & Events](#popups-events-and-utilities) · [Input Physics](#biological-input-physics-and-forms) · [Stealth](#stealth-and-anti-detection-architecture) · [Errors & Typing](#error-handling-and-typing) · [API Reference](#api-reference) · [Architecture](#architecture-under-the-hood) · [FAQ](#frequently-asked-questions)
 
 </div>
 
@@ -447,7 +449,7 @@ async with tab.listen_responses("*/api/*") as stream:
 
 ### Sniffing a Single AJAX / JSON Response (`wait_for_response`)
 
-`tab.wait_for_response(url_pattern, timeout_ms=30000)` subscribes to the tab's filtered CDP event stream, matches `Network.responseReceived` where `url` contains `url_pattern`, waits on the same stream for `Network.loadingFinished` (or `Network.loadingFailed`) for that `requestId` so large payloads finish transferring, and calls `Network.getResponseBody` (automatically decoding UTF-8 base64 payloads).
+`tab.wait_for_response(url_pattern, timeout_ms=30000)` subscribes to the tab's filtered CDP event stream, matches `Network.responseReceived` against either a substring or a `*`-wildcard glob (e.g. `"*/api/v1/items*"`), waits on the same stream for `Network.loadingFinished` (or `Network.loadingFailed`) for that `requestId` so large payloads finish transferring, and calls `Network.getResponseBody` (automatically decoding UTF-8 base64 payloads).
 
 ```python
 import json
@@ -517,6 +519,13 @@ await tab.storage_set("theme", "dark", session=False)
 val = await tab.storage_get("theme", session=False)
 all_items = await tab.storage_get(None, session=False)
 await tab.storage_clear(session=False)
+
+# Symmetric Playwright-format storage_state (cookies + active-origin localStorage)
+# Every file-path API accepts both str and pathlib.Path (os.PathLike)
+from pathlib import Path
+state_file = Path("auth_state.json")
+await tab.storage_state(state_file)
+restored = await tab.load_storage_state(state_file)  # {"cookies": N, "local_storage": M}
 ```
 
 ### Isolated Incognito Contexts (`browser.new_context()`)
@@ -554,6 +563,42 @@ async with await best_driver.start(headless=True, user_data_dir="./my_profile") 
     tab = await browser.get("https://example.com")
 ```
 
+### Keep-Open, Re-Attach (`connect()`), and Safe Profile Cleanup (`cleanup()`)
+
+Leave Chromium open after your script finishes (e.g. interactive headful login or debugging), attach to any already-running Chrome/Edge/Brave instance over CDP without taking process ownership, or safely sweep stale temporary profiles without risking live bot instances:
+
+```python
+import asyncio
+import best_driver
+
+
+async def keep_open_and_reattach() -> None:
+    # 1. Launch and keep Chromium alive even after `async with` exits
+    async with await best_driver.start(headless=False, keep_open=True) as browser:
+        port = browser.port
+        await browser.get("https://example.com")
+        # Or detach dynamically mid-run: browser.detach()
+
+    # 2. Re-attach later by port, HTTP URL, host:port, or ws://... URL
+    #    stop() / async with exit closes the CDP WebSocket cleanly without killing Chrome
+    async with await best_driver.connect(port) as attached:
+        tab = await attached.main_tab()
+        print("Re-attached:", await tab.title())
+        # Optionally wait until the user closes the window manually:
+        # await attached.wait_until_closed()
+
+
+# 3. Conflict-safe cleanup of stale `best_driver_profile_*` temp directories
+#    Never touches personal Chrome profiles or browsers owned by live Python scripts.
+#    Uses Windows atomic rename staging + POSIX SingletonLock/PPID tree checks.
+report = best_driver.cleanup(
+    kill_orphans=False,      # Set True to terminate true orphan Chromium trees (dead parent PID)
+    min_age_seconds=60.0,    # Skip profiles touched in the last 60s
+    dry_run=False,           # Set True to preview without deleting
+)
+print(report["removed_dirs"], report["freed_bytes"], report["skipped_in_use"])
+```
+
 ### Authenticated HTTP and SOCKS5 Proxies
 
 Inline proxy credentials (`http://user:pass@host:port`) are split automatically before launching Chromium; authentication challenges are answered natively via CDP `Fetch.authRequired` without requiring browser extensions:
@@ -569,20 +614,82 @@ For handing off the active session (including proxy, IP family, cookies, and TLS
 
 ---
 
+## Popups, Events, and Utilities
+
+### Race-Free Popup Capture (`expect_popup` & `listen_popups`)
+
+Capture `window.open()` and `<a target="_blank">` popups with stealth evasion, `BrowserContext` proxy/emulation, and init scripts pre-armed before the first JavaScript instruction runs (zero `Runtime.enable` overhead):
+
+```python
+# Playwright-style context manager (recommended)
+async with tab.expect_popup(timeout_ms=15000) as popup_info:
+    await tab.click("a[target='_blank']")
+popup = await popup_info.value
+print("Popup URL:", await popup.url())
+
+# Or stream multiple popups continuously
+async with tab.listen_popups() as popups:
+    async for p in popups:
+        print("Opened:", await p.url())
+        break
+```
+
+### Opt-In Console, Page Errors, and Renderer Crash Monitoring
+
+`listen_console()` and `listen_page_errors()` use reference-counted `Runtime.enable` / `Runtime.disable` scoped strictly to the active block so default stealth is restored automatically on exit. `listen_crashes()` and `tab.is_alive()` never touch `Runtime.enable`:
+
+```python
+# Capture warnings & errors, then auto-disable Runtime on exit
+async with tab.listen_console(types=["warning", "error"]) as console_stream:
+    await tab.evaluate("console.warn('rate limit approaching')")
+    msg = await console_stream.next(timeout_ms=5000)
+    print(msg.type, msg.text, msg.url, msg.line)
+
+async with tab.listen_page_errors() as err_stream:
+    err = await err_stream.next(timeout_ms=5000)
+    if err:
+        print(err.name, err.message)
+
+# Detect renderer crashes in long-running 24/7 workers
+async with tab.listen_crashes() as crashes:
+    alive = await tab.is_alive()
+```
+
+### Permissions, OS Window Bounds, and Auto-Dialogs
+
+```python
+# Context-scoped permissions (Playwright aliases supported)
+await tab.grant_permissions(["clipboard-read", "clipboard-write", "notifications"])
+
+# Real OS window control for headful sessions
+bounds = await tab.get_window_bounds()
+await tab.set_window_bounds(width=1280, height=800, left=80, top=60)
+await tab.set_window_bounds(state="maximized")
+
+# Automatic JavaScript alert/confirm/prompt handling (pass None to disable)
+tab.auto_dialog(accept=True, prompt_text="confirmed")
+```
+
+---
+
 ## Biological Input Physics and Forms
 
 - **Cubic Bezier Cursor Movement**: `mouse_move()`, `mouse_click()`, `click()`, `hover()`, and `Element.click()` move along a randomized 4-point Cubic Bezier arc with smoothstep acceleration/deceleration easing, sub-pixel micro-tremors, and slight off-center target landing inside the element's bounding box.
 - **Biological Typing (`human_type`)**: Dispatches real `keyDown`/`keyUp` CDP events with variable hold durations and natural inter-key pauses at spaces, punctuation (`.`, `,`, `!`, `?`), and word boundaries. Supports `\n` to press Enter.
 - **Instant Input (`fill`)**: Clears via native selection + Backspace and inserts text immediately via `Input.insertText` (fires React/Vue `input` events).
 - **Slider Captcha Gestures (`swipe`)**: Smooth S-curve drag with perpendicular micro-jitter while holding `buttons: 1`.
-- **Special Keys (`press_key`)**: Supports `Enter` / `Return`, `Tab`, `Escape` / `Esc`, `Backspace`, `Delete` / `Del`, `Space`, `ArrowUp` / `Up`, `ArrowDown` / `Down`, `ArrowLeft` / `Left`, `ArrowRight` / `Right`, `Home`, `End`, `PageUp`, `PageDown` (case-insensitive).
-- **Forms & File Uploads**: `select_option()` matches `<option>` by `value` or visible text; `check()` / `uncheck()` click only when state differs and fall back to associated `<label>` elements for custom-styled hidden inputs; `upload_file()` attaches one or multiple absolute paths via `DOM.setFileInputFiles` without triggering OS file dialogs.
+- **Special Keys & Modifier Chords (`press_key`)**: Supports single keys (`Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, `Insert`, `Space`, arrow/nav keys, `F1`–`F12`) and `+`-separated chords (`"Control+a"`, `"Control+c"`, `"Control+v"`, `"Ctrl+Shift+z"`, `"Shift+Enter"`, `"Meta+a"`) with native Blink editing commands (`selectAll`, `copy`, `cut`, `paste`, `undo`, `redo`).
+- **Forms, Closed Shadow DOM & `pathlib.Path`**: `select_option()`, `check()` / `uncheck()`, `upload_file()`, `fill()`, `human_type()`, `wait_for()`, `attr()`, `value()`, `html()`, `hover()`, and `screenshot(selector=...)` all fall back seamlessly into `#shadow-root (closed)` trees; every file-path parameter accepts `str` or `pathlib.Path` (`os.PathLike`).
 
 ```python
+from pathlib import Path
+
 await tab.human_type("@name=query", "rust cdp driver\n", clear=True)
+await tab.press_key("Control+a")
+await tab.press_key("Control+c")
 await tab.select_option("#country", "United States")
 await tab.check("#accept-terms")
-await tab.upload_file("input[type='file']", ["report.pdf", "summary.png"])
+await tab.upload_file("input[type='file']", [Path("report.pdf"), Path("summary.png")])
 await tab.swipe(120.0, 340.0, 380.0, 342.0)
 ```
 
@@ -653,15 +760,19 @@ except TimeoutError:
     print("Results did not appear within 5 seconds")
 ```
 
-### PEP 561 Static Typing
+### PEP 561 Static Typing & IDE Autocomplete (VS Code & PyCharm)
 
-The package includes `py.typed` and [`python/best_driver/__init__.pyi`](https://github.com/real-coder-xD/best-driver/blob/main/python/best_driver/__init__.pyi), exporting `Browser`, `Tab`, `Element`, `start`, and typed dictionary aliases (`ElementRect`, `NetworkResponse`, `FrameInfo`, `DownloadInfo`, `WaitUntil`, `MouseButton`, `ImageFormat`). Static type checkers (Mypy, Pyright, Pylance) pick up full signatures and hover docstrings automatically with no extra configuration.
+The package ships with `py.typed`, [`python/best_driver/__init__.pyi`](https://github.com/real-coder-xD/best-driver/blob/main/python/best_driver/__init__.pyi), and [`python/best_driver/best_driver.pyi`](https://github.com/real-coder-xD/best-driver/blob/main/python/best_driver/best_driver.pyi) (sibling stub for the compiled Rust `.pyd`/`.so` extension), exporting full signatures, hover docstrings, `@overload`s (for `tls_session()` and `storage_get()`), `Literal`s (`WaitUntil`, `MouseButton`, `ImageFormat`, `RouteStage`, `LocatorState`, `WindowState`, `PermissionName`, `SpecialKey`), and `TypedDict`s (`ElementRect`, `ElementDict`, `Cookie`, `FetchResponse`, `NetworkResponse`, `FrameInfo`, `DownloadInfo`, `BrowserFingerprint`, `StorageState`, `LoadedStorageState`, `WindowBounds`, `ViewportSize`, `CleanupReport`).
+
+- **VS Code (Pylance / Pyright)**: Works out of the box with zero configuration — select the Python interpreter where `best-driver` is installed (`Ctrl+Shift+P` -> `Python: Select Interpreter`). After upgrading `best-driver`, run `Developer: Reload Window` (or `Python: Restart Language Server`) if Pylance caches an older stub.
+- **PyCharm**: Works out of the box via `py.typed` + `best_driver.pyi` (no binary skeleton guesswork on the Rust extension). Ensure the project interpreter points to the virtualenv containing `best-driver`; after upgrading, run `File -> Invalidate Caches...` only if PyCharm retains stale stubs.
+- **Mypy / Pyright CLI**: Recognized automatically as a PEP 561 typed package (`Typing :: Typed`).
 
 ---
 
 ## API Reference
 
-### Top-Level Function
+### Top-Level Functions
 
 #### `best_driver.start(...)`
 
@@ -672,10 +783,37 @@ async def start(
     browser_path: Optional[str] = None,
     extra_args: Optional[Sequence[str]] = None,
     proxy: Optional[str] = None,
+    keep_open: bool = False,
 ) -> Browser
 ```
 
-Launches Chromium on an OS-assigned loopback debugging port, connects a single browser-level CDP WebSocket, strips `HeadlessChrome` UA/Client Hints if running headless, and arms `Target.setAutoAttach` for popups and OOPIFs.
+Launches Chromium on an OS-assigned loopback debugging port, connects a single browser-level CDP WebSocket, strips `HeadlessChrome` UA/Client Hints if running headless, and arms `Target.setAutoAttach` for popups and OOPIFs. Set `keep_open=True` to leave Chromium running independently after `stop()`, `async with`, or Python exit.
+
+#### `best_driver.connect(...)`
+
+```python
+async def connect(
+    endpoint: Union[int, str],
+    proxy: Optional[str] = None,
+) -> Browser
+```
+
+Attaches over flattened CDP to an already-running Chromium instance (`9222`, `"http://127.0.0.1:9222"`, `"host:port"`, or `"ws://..."`) without taking process ownership (`stop()` disconnects cleanly without killing the external browser).
+
+#### `best_driver.cleanup(...)`
+
+```python
+def cleanup(
+    *,
+    kill_orphans: bool = False,
+    min_age_seconds: float = 0.0,
+    exclude_dirs: Optional[Sequence[str]] = None,
+    dry_run: bool = False,
+    temp_dir: Optional[str] = None,
+) -> CleanupReport
+```
+
+Safely removes stale `best_driver_profile_*` temporary directories (and optionally terminates true orphan Chromium processes whose parent launcher PID is dead when `kill_orphans=True`). Active browsers owned by live scripts and personal Chrome profiles are never touched.
 
 ---
 
@@ -687,13 +825,15 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 | `user_data_dir` | `str` (property) | Active Chromium profile directory path. |
 | `ws_url` | `str` (property) | Browser-level CDP WebSocket URL shared by all flattened sessions. |
 | `proxy` | `Optional[str]` (property) | Proxy URL passed to `best_driver.start(proxy=...)`, or `None`. |
-| `is_alive()` | `async () -> bool` | Returns `True` if the Chromium child process is still running. |
+| `is_alive()` | `async () -> bool` | Returns `True` if the Chromium process / CDP WebSocket is still running. |
+| `detach()` | `() -> None` | Detaches Chromium from `stop()` / `Drop` cleanup so the window stays open after Python exits. |
+| `wait_until_closed()` | `async (poll_ms: int = 250) -> None` | Awaits until the Chromium window is closed or the CDP WebSocket disconnects. |
 | `main_tab()` | `async () -> Tab` | Returns the primary active page tab (creating one if none exist). |
 | `new_tab()` | `async (url: str = "about:blank") -> Tab` | Opens a new tab via `Target.createTarget` with evasion armed before navigation. |
 | `tabs()` | `async () -> list[Tab]` | Lists all open `page` targets via `Target.getTargets`. |
 | `get()` | `async (url: str, new_tab: bool = False, wait_until: WaitUntil = "load") -> Tab` | Navigates the main tab (or a new tab if `new_tab=True`) to `url`. |
 | `new_context()` | `async (proxy=None, ..., viewport=None, locale=None, timezone=None, extra_headers=None) -> BrowserContext` | Creates an isolated incognito context with separate cookies, storage, proxy, and emulation overrides. |
-| `stop()` | `async () -> None` | Sends graceful `Browser.close` (up to 1.5s wait), then kills and reaps the child process. |
+| `stop()` | `async () -> None` | Sends graceful `Browser.close` (up to 1.5s wait), then kills and reaps the child process (or disconnects cleanly when detached). |
 | Context manager | `async with await best_driver.start() as browser:` | Automatically calls `await browser.stop()` on block exit. |
 
 ### `BrowserContext`
@@ -738,13 +878,16 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 | `add_init_script()` | `async (script: str) -> str` | Injects JS via `Page.addScriptToEvaluateOnNewDocument` before any page script executes. |
 | `fetch()` | `async (url, method="GET", headers=None, body=None, json=None, credentials="include") -> FetchResponse` | Executes a real in-browser `fetch()` over Chromium's native TLS stack and cookie jar. |
 | `fingerprint()` | `async () -> BrowserFingerprint` | Captures live `impersonate`, `user_agent`, `sec_ch_ua*`, `accept_language`, `headers`, `header_order`, and `proxy`. |
-| `storage_state()` | `async (path: Optional[str] = None) -> StorageState` | Exports all CDP cookies (including `HttpOnly`) and live browser headers in Playwright / `http_tls` format. |
-| `tls_session()` | `async (async_mode: bool = True, **kwargs) -> HttpTlsAsyncSession \| HttpTlsSession` | Creates a typed `http_tls.AsyncSession` (or `Session`) synced with this tab's fingerprint, proxy, headers, and cookies. |
+| `storage_state()` / `load_storage_state()` | `async (path=None) -> StorageState` / `async (state_or_path) -> dict[str, int]` | Exports and restores context-scoped CDP cookies (`HttpOnly`) plus active-origin `localStorage` in Playwright / `http_tls` format. |
+| `tls_session()` | `async (async_mode: bool = True, **kwargs) -> HttpTlsAsyncSession \| HttpTlsSession` | Creates a typed `http_tls.AsyncSession` (or `Session`) synced with this tab's fingerprint, proxy, headers, and cookies (supports `http-tls>=1.3.0` ECH/HTTP/3/DoH kwargs). |
 | `sync_from_tls()` | `async (session, default_url: Optional[str] = None) -> int` | Pushes updated cookies from an `http_tls` session back into this Chromium tab. |
-| `locator()` | `(query: str) -> Locator` | Returns a lazy, auto-retrying chained `Locator` (`filter`, `first`, `last`, `nth`, `wait_for`, forms). |
+| `locator()` | `(query: str) -> Locator` | Returns a lazy, auto-retrying chained `Locator` (`filter`, `first`, `last`, `nth`, `wait_for`, forms, mixed-comma Smart Locators). |
 | `route()` / `unroute()` | `async (url_pattern, handler, stage="request")` / `async (url_pattern=None)` | Intercepts requests or responses (`fulfill`, `continue_`, `continue_response`, `abort`, `fetch`). |
 | `record_har()` / `export_har()` / `stop_har()` | `async (...) -> HarRecorder \| dict` | Records and exports full HAR 1.2 network traces for this tab. |
 | `listen_requests()` / `listen_responses()` | `(url_pattern: Optional[str] = None) -> RequestStream \| ResponseStream` | Opens a continuous live async stream of matching HTTP requests or responses. |
+| `expect_popup()` / `listen_popups()` | `(timeout_ms: int = 30000) -> PopupExpectation` / `() -> PopupStream` | Race-free popup capture (`window.open` / `target="_blank"`) inheriting owning `BrowserContext` and pre-armed stealth. |
+| `listen_console()` / `listen_page_errors()` | `(types=None) -> ConsoleStream` / `() -> PageErrorStream` | Opt-in refcounted `Runtime.enable` streams that automatically call `Runtime.disable` on exit to restore stealth. |
+| `listen_crashes()` / `is_alive()` | `() -> CrashStream` / `async () -> bool` | Stealth-safe `Inspector.targetCrashed` stream and live target/renderer health check. |
 | `iframe()` | `async (selector: str, timeout_ms: int = 10000) -> Tab` | Returns a `Tab` scoped to the matched same-origin, nested, or OOPIF `<iframe>`. |
 | `frames()` | `async () -> list[FrameInfo]` | Flattened list of frames (`id`, `parent_id`, `name`, `url`) from `Page.getFrameTree`. |
 | `set_download_dir()` | `async (download_dir: str) -> str` | Configures download folder and returns its canonical absolute path. |
@@ -791,7 +934,7 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 | `human_type()` | `async (selector: str, text: str, clear: bool = False, timeout_ms: int = 10000) -> None` | Biological cadence typing with word and punctuation pauses. |
 | `send_keys()` / `type_text()` | `async (..., delay_ms: int = 60, ...) -> None` | Character-by-character typing with jitter. |
 | `fill()` / `focus()` / `clear()` | `async (selector: str, ...) -> None` | Fast paste fill, focus, or select-all + Backspace clear. |
-| `press_key()` | `async (key: str) -> None` | Dispatches a named special key event pair. |
+| `press_key()` | `async (key: str) -> None` | Dispatches a single key or modifier chord (`"Enter"`, `"F5"`, `"Control+a"`, `"Ctrl+Shift+Z"`, `"Shift+Enter"`). |
 | `select_option()` / `check()` / `uncheck()` | `async (selector: str, ...) -> None` | Dropdown selection and checkbox/radio toggling. |
 | `upload_file()` | `async (selector: str, files: Union[str, Sequence[str]], timeout_ms: int = 10000) -> None` | Sets local file path(s) on `<input type="file">`. |
 | `scroll_down()` / `scroll_up()` | `async (pixels: float = 600.0) -> None` | Dispatches incremental wheel ticks. |
@@ -807,7 +950,9 @@ Launches Chromium on an OS-assigned loopback debugging port, connects a single b
 | `delete_cookies()` / `clear_cookies()` / `save_cookies()` / `load_cookies()` | `async (...) -> ...` | Delete, clear, and JSON file cookie persistence. |
 | `storage_get()` / `storage_set()` / `storage_clear()` | `async (..., session: bool = False) -> ...` | `localStorage` and `sessionStorage` manipulation. |
 | `set_viewport()` / `clear_viewport()` | `async (width, height, scale=1.0, mobile=False) -> None` | Device viewport metrics override and reset. |
+| `get_window_bounds()` / `set_window_bounds()` | `async () -> dict` / `async (width=None, height=None, left=None, top=None, state=None) -> None` | Reads or updates real OS window geometry and state (`normal`, `minimized`, `maximized`, `fullscreen`). |
 | `set_user_agent()` / `set_timezone()` / `set_locale()` / `set_geolocation()` | `async (...) -> None` | Emulation overrides for UA, timezone, locale, and coordinates. |
+| `grant_permissions()` | `async (permissions: Sequence[str], origin: Optional[str] = None) -> None` | Grants context-scoped browser permissions (`notifications`, `clipboard-read`, `clipboard-write`, `camera`, `microphone`, `geolocation`). |
 | `auto_dialog()` / `handle_dialog()` | `(accept=True, prompt_text=None)` / `async (...)` | Synchronous auto-handler toggle or one-shot JS dialog response. |
 | `screenshot()` | `async (file_path=None, full_page=False, format="png", quality=None, selector=None) -> bytes` | PNG/JPEG/WEBP capture of viewport, full document, or element clip. |
 | `pdf()` | `async (file_path=None, landscape=False) -> bytes` | Vector PDF export with background graphics enabled. |
