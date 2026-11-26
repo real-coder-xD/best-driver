@@ -37,7 +37,7 @@ jobs:
       - name: Build wheel & run E2E Chromium pytest suite
         run: |
           python -m pip install --upgrade pip maturin pytest
-          maturin build --release --out dist
+          maturin build --release -i "$(which python)" --out dist
           pip install --force-reinstall dist/best_driver-*.whl
           pytest -v tests/
 

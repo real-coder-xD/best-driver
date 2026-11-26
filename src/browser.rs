@@ -362,13 +362,44 @@ impl BrowserProcess {
             args.push("--headless=new".to_string());
         }
 
+        // Auto-add `--no-sandbox` / `--disable-dev-shm-usage` on Linux containers, root, CI,
+        // or Ubuntu 24.04+ hosts where AppArmor restricts unprivileged user namespaces.
+        #[cfg(target_os = "linux")]
+        {
+            let is_container = std::path::Path::new("/.dockerenv").exists()
+                || std::path::Path::new("/run/.containerenv").exists();
+            let is_ci = std::env::var_os("CI").is_some();
+            let is_root = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("Uid:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .map(|uid| uid == "0")
+                })
+                .unwrap_or(false);
+            let apparmor_restricted =
+                std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                    .ok()
+                    .map(|s| s.trim() == "1")
+                    .unwrap_or(false);
+            if is_container || is_ci || is_root || apparmor_restricted {
+                if !args.iter().any(|a| a == "--no-sandbox") {
+                    args.push("--no-sandbox".to_string());
+                }
+                if !args.iter().any(|a| a == "--disable-dev-shm-usage") {
+                    args.push("--disable-dev-shm-usage".to_string());
+                }
+            }
+        }
+
         args = merge_browser_args(args, extra_args);
 
         if let Some(url) = start_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             args.push(url.to_string());
         }
 
-        let child = Command::new(&binary)
+        let mut child = Command::new(&binary)
             .args(&args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -381,6 +412,12 @@ impl BrowserProcess {
             if let Some(ws) = fetch_browser_ws_url(port).await {
                 browser_ws_url = ws;
                 break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(DriverError::Launch(format!(
+                    "Trình duyệt thoát sớm trước khi mở cổng CDP (status={})",
+                    status
+                )));
             }
         }
 

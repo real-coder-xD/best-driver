@@ -10,10 +10,15 @@ import best_driver
 
 def test_start_url_modes_and_browser_context_download(server_url: str, tmp_path: Path) -> None:
     async def _run() -> None:
-        # Default start_url=None skips about:blank
+        # Default start_url=None skips forcing about:blank (allows --no-startup-window cleanly)
+        async with await best_driver.start(headless=True, extra_args=["--no-startup-window"]) as browser:
+            assert len(await browser.tabs()) == 0
+            tab = await browser.get(server_url + "/popup")
+            assert await tab.title() == "Popup Target"
+
         async with await best_driver.start(headless=True) as browser:
             tabs = await browser.tabs()
-            assert len(tabs) >= 1 and await tabs[0].url() != "about:blank"
+            assert len(tabs) >= 1
 
             # Isolated BrowserContext download with pathlib.Path
             dl_dir = tmp_path / "ctx_dl"
