@@ -407,7 +407,8 @@ impl BrowserProcess {
             .map_err(|e| DriverError::Launch(format!("Lỗi khi khởi chạy process trình duyệt: {}", e)))?;
 
         let mut browser_ws_url = String::new();
-        for _ in 0..80 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if let Some(ws) = fetch_browser_ws_url(port).await {
                 browser_ws_url = ws;
