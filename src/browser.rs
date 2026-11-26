@@ -318,6 +318,7 @@ impl BrowserProcess {
         browser_path: Option<String>,
         extra_args: Option<Vec<String>>,
         detached: Arc<AtomicBool>,
+        start_url: Option<String>,
     ) -> DriverResult<Self> {
         let binary = Self::find_chrome(browser_path.as_deref())?;
         let port = Self::get_free_port();
@@ -363,7 +364,9 @@ impl BrowserProcess {
 
         args = merge_browser_args(args, extra_args);
 
-        args.push("about:blank".to_string());
+        if let Some(url) = start_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            args.push(url.to_string());
+        }
 
         let child = Command::new(&binary)
             .args(&args)

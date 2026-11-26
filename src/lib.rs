@@ -334,6 +334,7 @@ impl BrowserCore {
         extra_args: Option<Vec<String>>,
         proxy: Option<String>,
         keep_open: bool,
+        start_url: Option<String>,
     ) -> DriverResult<Self> {
         let mut args = extra_args.unwrap_or_default();
         let raw_proxy = proxy.clone();
@@ -354,6 +355,7 @@ impl BrowserCore {
             browser_path,
             Some(args),
             Arc::clone(&detached),
+            start_url,
         )
         .await?;
         let port = proc.port;
@@ -2599,8 +2601,9 @@ impl PyBrowser {
 }
 
 /// Launch a browser over a single flattened browser-level CDP WebSocket.
+#[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (headless=false, user_data_dir=None, browser_path=None, extra_args=None, proxy=None, keep_open=false))]
+#[pyo3(signature = (headless=false, user_data_dir=None, browser_path=None, extra_args=None, proxy=None, keep_open=false, start_url=None))]
 fn start<'py>(
     py: Python<'py>,
     headless: bool,
@@ -2609,13 +2612,22 @@ fn start<'py>(
     extra_args: Option<Vec<String>>,
     proxy: Option<String>,
     keep_open: bool,
+    start_url: Option<String>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let data_dir = py_to_opt_path(user_data_dir)?;
     let bin_path = py_to_opt_path(browser_path)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let core = BrowserCore::launch(headless, data_dir, bin_path, extra_args, proxy, keep_open)
-            .await
-            .map_err(rt)?;
+        let core = BrowserCore::launch(
+            headless,
+            data_dir,
+            bin_path,
+            extra_args,
+            proxy,
+            keep_open,
+            start_url,
+        )
+        .await
+        .map_err(rt)?;
         Ok(PyBrowser {
             inner: Arc::new(core),
         })

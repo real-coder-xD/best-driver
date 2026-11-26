@@ -2,6 +2,11 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.3.4] - 2026-11-26
+
+### Changed
+- **Configurable `start_url` (Skip `about:blank` by Default)**: Added `start_url: Optional[str] = None` to `best_driver.start(...)`. By default (`start_url=None`), Chromium launches without appending `about:blank` — opening its native New Tab page (`chrome://new-tab-page/`), honoring persistent `user_data_dir` session restore, and working cleanly with `extra_args=["--no-startup-window"]` or custom startup URLs. Pass `start_url="about:blank"` or `start_url="https://..."` whenever an explicit launch page is desired.
+
 ## [0.3.3] - 2026-11-26
 
 ### Added

@@ -779,15 +779,16 @@ The package ships with `py.typed`, [`python/best_driver/__init__.pyi`](https://g
 ```python
 async def start(
     headless: bool = False,
-    user_data_dir: Optional[str] = None,
-    browser_path: Optional[str] = None,
+    user_data_dir: Optional[PathLike] = None,
+    browser_path: Optional[PathLike] = None,
     extra_args: Optional[Sequence[str]] = None,
     proxy: Optional[str] = None,
     keep_open: bool = False,
+    start_url: Optional[str] = None,
 ) -> Browser
 ```
 
-Launches Chromium on an OS-assigned loopback debugging port, connects a single browser-level CDP WebSocket, strips `HeadlessChrome` UA/Client Hints if running headless, and arms `Target.setAutoAttach` for popups and OOPIFs. Set `keep_open=True` to leave Chromium running independently after `stop()`, `async with`, or Python exit.
+Launches Chromium on an OS-assigned loopback debugging port, connects a single browser-level CDP WebSocket, strips `HeadlessChrome` UA/Client Hints if running headless, and arms `Target.setAutoAttach` for popups and OOPIFs. By default `start_url=None` skips appending `about:blank` (so Chromium opens its native New Tab page, respects persistent profile restore, and avoids duplicate blank tabs when URLs or `--no-startup-window` are passed); pass `start_url="about:blank"` or `start_url="https://..."` to open a specific page on launch. Set `keep_open=True` to leave Chromium running independently after `stop()`, `async with`, or Python exit.
 
 #### `best_driver.connect(...)`
 

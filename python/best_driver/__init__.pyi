@@ -1587,6 +1587,7 @@ async def start(
     extra_args: Optional[Sequence[str]] = None,
     proxy: Optional[str] = None,
     keep_open: bool = False,
+    start_url: Optional[str] = None,
 ) -> Browser:
     """Launch Chromium over a single flattened browser-level CDP WebSocket.
 
@@ -1597,6 +1598,7 @@ async def start(
         extra_args: Additional Chromium command-line flags.
         proxy: Proxy URL (`"http://host:port"`, `"http://user:pass@host:port"`, `"socks5://host:port"`).
         keep_open: Keep Chromium running independently after `stop()`, `async with`, or Python exit.
+        start_url: Optional initial URL argument passed to Chromium (`None` skips `about:blank` by default; pass `"about:blank"` or `"https://..."` to open a specific page on launch).
     """
     ...
 

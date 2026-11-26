@@ -643,7 +643,7 @@ class HarRecorder:
         return {
             "log": {
                 "version": "1.2",
-                "creator": {"name": "best-driver", "version": "0.3.3"},
+                "creator": {"name": "best-driver", "version": "0.3.4"},
                 "entries": list(self.entries),
             }
         }
@@ -731,7 +731,7 @@ async def export_har(
     har = (
         rec.to_har()
         if rec is not None
-        else {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.3"}, "entries": []}}
+        else {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.4"}, "entries": []}}
     )
     if path is not None:
         with open(os.fspath(path), "w", encoding="utf-8") as fh:
@@ -743,7 +743,7 @@ async def stop_har(tab: Any) -> Dict[str, Any]:
     """Stop HAR 1.2 recording on `tab` and return the captured HAR dictionary."""
     rec = _HAR_RECORDERS.pop(tab.session_id, None)
     if rec is None:
-        return {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.3"}, "entries": []}}
+        return {"log": {"version": "1.2", "creator": {"name": "best-driver", "version": "0.3.4"}, "entries": []}}
     await rec.stop()
     return rec.to_har()
 
