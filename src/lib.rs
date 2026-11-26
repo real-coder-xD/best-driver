@@ -18,7 +18,7 @@ mod tab;
 use browser::{build_headless_ua_override, resolve_cdp_ws_url, BrowserProcess};
 use cdp::{CdpConnection, SessionEventRx};
 use error::{DriverError, DriverResult};
-use tab::{Tab, EVASION_JS};
+use tab::{Tab, EVASION_JS, EVASION_NOISE_JS};
 
 // ───────────────────────────── Conversions ─────────────────────────────
 
@@ -224,7 +224,30 @@ fn split_proxy(raw: &str) -> (String, Option<ProxyAuth>) {
 
 type ArmedMap = Arc<Mutex<HashMap<String, Arc<OnceCell<()>>>>>;
 
-/// Injects evasion script + headless UA override + nested OOPIF auto-attach ONCE per target (race-free via OnceCell).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StealthMode {
+    Standard,
+    Minimal,
+    Aggressive,
+    Off,
+}
+
+impl StealthMode {
+    fn parse(s: &str) -> DriverResult<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "standard" => Ok(Self::Standard),
+            "minimal" => Ok(Self::Minimal),
+            "aggressive" => Ok(Self::Aggressive),
+            "off" | "none" => Ok(Self::Off),
+            other => Err(DriverError::InvalidInput(format!(
+                "stealth mode không hợp lệ '{}'; hỗ trợ 'standard', 'minimal', 'aggressive', 'off'",
+                other
+            ))),
+        }
+    }
+}
+
+/// Injects evasion script (per `StealthMode`) + headless UA override + nested OOPIF auto-attach ONCE per target.
 /// Pipelines commands concurrently with optional `Runtime.runIfWaitingForDebugger` in strict wire order so
 /// `<a target="_blank">` (`canAccessOpener: false`) targets paused at `waitForDebuggerOnStart` never deadlock.
 async fn arm_target_once(
@@ -233,6 +256,7 @@ async fn arm_target_once(
     target_id: &str,
     session_id: &str,
     headless_ua: Option<&Value>,
+    stealth: StealthMode,
     resume_if_waiting: bool,
 ) {
     let cell = {
@@ -244,17 +268,38 @@ async fn arm_target_once(
     };
     cell.get_or_init(|| async {
         let f_ua = async {
-            if let Some(ua_params) = headless_ua {
-                let _ = conn
-                    .call_raw(Some(session_id), "Emulation.setUserAgentOverride", ua_params.clone())
-                    .await;
+            if stealth != StealthMode::Off {
+                if let Some(ua_params) = headless_ua {
+                    let _ = conn
+                        .call_raw(Some(session_id), "Emulation.setUserAgentOverride", ua_params.clone())
+                        .await;
+                }
             }
         };
-        let f_evasion = conn.call_raw(
-            Some(session_id),
-            "Page.addScriptToEvaluateOnNewDocument",
-            json!({ "source": EVASION_JS }),
-        );
+        let f_evasion = async {
+            match stealth {
+                StealthMode::Standard => {
+                    let _ = conn
+                        .call_raw(
+                            Some(session_id),
+                            "Page.addScriptToEvaluateOnNewDocument",
+                            json!({ "source": EVASION_JS }),
+                        )
+                        .await;
+                }
+                StealthMode::Aggressive => {
+                    let combined = format!("{}\n{}", EVASION_JS, EVASION_NOISE_JS);
+                    let _ = conn
+                        .call_raw(
+                            Some(session_id),
+                            "Page.addScriptToEvaluateOnNewDocument",
+                            json!({ "source": combined }),
+                        )
+                        .await;
+                }
+                StealthMode::Minimal | StealthMode::Off => {}
+            }
+        };
         let f_page = conn.call_raw(Some(session_id), "Page.enable", json!({}));
         let f_auto = conn.call_raw(
             Some(session_id),
@@ -289,6 +334,7 @@ pub struct BrowserCore {
     api_created_targets: Arc<Mutex<HashSet<String>>>,
     context_configs: ContextConfigMap,
     headless_ua: Option<Value>,
+    stealth: StealthMode,
     proxy: Option<String>,
     proxy_auth: Option<ProxyAuth>,
     auto_attach_task: Mutex<Option<JoinHandle<()>>>,
@@ -327,6 +373,7 @@ fn evict_python_sessions(session_ids: &[String]) {
 }
 
 impl BrowserCore {
+    #[allow(clippy::too_many_arguments)]
     async fn launch(
         headless: bool,
         user_data_dir: Option<String>,
@@ -335,6 +382,7 @@ impl BrowserCore {
         proxy: Option<String>,
         keep_open: bool,
         start_url: Option<String>,
+        stealth: StealthMode,
     ) -> DriverResult<Self> {
         let mut args = extra_args.unwrap_or_default();
         let raw_proxy = proxy.clone();
@@ -362,7 +410,7 @@ impl BrowserCore {
         let ws_url = proc.ws_url.clone();
         let user_data_dir = proc.user_data_dir.to_string_lossy().to_string();
 
-        Self::from_parts(Some(proc), port, user_data_dir, ws_url, raw_proxy, proxy_auth, detached).await
+        Self::from_parts(Some(proc), port, user_data_dir, ws_url, raw_proxy, proxy_auth, detached, stealth).await
     }
 
     async fn connect_existing(endpoint: &str, proxy: Option<String>) -> DriverResult<Self> {
@@ -371,9 +419,10 @@ impl BrowserCore {
         let proxy_auth = proxy.as_deref().and_then(|p| split_proxy(p).1);
         // Externally launched browsers are always detached so stop()/Drop never kill them
         let detached = Arc::new(AtomicBool::new(true));
-        Self::from_parts(None, port, String::new(), ws_url, raw_proxy, proxy_auth, detached).await
+        Self::from_parts(None, port, String::new(), ws_url, raw_proxy, proxy_auth, detached, StealthMode::Standard).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn from_parts(
         proc: Option<BrowserProcess>,
         port: u16,
@@ -382,6 +431,7 @@ impl BrowserCore {
         raw_proxy: Option<String>,
         proxy_auth: Option<ProxyAuth>,
         detached: Arc<AtomicBool>,
+        stealth: StealthMode,
     ) -> DriverResult<Self> {
         // Single browser-level CDP WebSocket shared by all tabs, popups, and OOPIF iframes
         let conn = CdpConnection::connect(&ws_url).await?;
@@ -514,7 +564,7 @@ impl BrowserCore {
                         let ua_c = ua_sup.clone();
                         tokio::spawn(async move {
                             if (ttype == "page" || ttype == "iframe") && !tid.is_empty() {
-                                arm_target_once(&conn_c, &armed_c, &tid, &sid, ua_c.as_ref(), waiting).await;
+                                arm_target_once(&conn_c, &armed_c, &tid, &sid, ua_c.as_ref(), stealth, waiting).await;
                             } else if waiting {
                                 // Unconditionally resume non-page/iframe paused targets (workers, etc.)
                                 let _ = conn_c
@@ -588,6 +638,7 @@ impl BrowserCore {
             api_created_targets,
             context_configs,
             headless_ua,
+            stealth,
             proxy: raw_proxy,
             proxy_auth,
             auto_attach_task: Mutex::new(Some(auto_attach_task)),
@@ -654,6 +705,7 @@ impl BrowserCore {
             &target_id,
             &session_id,
             self.headless_ua.as_ref(),
+            self.stealth,
             false,
         )
         .await;
@@ -1057,15 +1109,16 @@ impl PyElement {
         format!("<Element <{}> id='{}' text='{}'>", tag, id, short_text)
     }
 
-    #[pyo3(signature = (button="left".to_string(), click_count=1))]
+    #[pyo3(signature = (button="left".to_string(), click_count=1, force=false))]
     fn click<'py>(
         &self,
         py: Python<'py>,
         button: String,
         click_count: i64,
+        force: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let nid = self.backend_node_id;
-        fut!(py, self.tab, |t| t.click_node(nid, &button, click_count).await)
+        fut!(py, self.tab, |t| t.click_node(nid, &button, click_count, force).await)
     }
 
     fn hover<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -1529,7 +1582,7 @@ impl PyTab {
     }
 
     // mouse
-    #[pyo3(signature = (selector, button="left".to_string(), click_count=1, timeout_ms=10000))]
+    #[pyo3(signature = (selector, button="left".to_string(), click_count=1, timeout_ms=10000, force=false))]
     fn click<'py>(
         &self,
         py: Python<'py>,
@@ -1537,18 +1590,19 @@ impl PyTab {
         button: String,
         click_count: i64,
         timeout_ms: u64,
+        force: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |t| t.click(&selector, &button, click_count, timeout_ms).await)
+        fut!(py, self.inner, |t| t.click(&selector, &button, click_count, timeout_ms, force).await)
     }
 
-    #[pyo3(signature = (selector, timeout_ms=10000))]
-    fn double_click<'py>(&self, py: Python<'py>, selector: String, timeout_ms: u64) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |t| t.click(&selector, "left", 2, timeout_ms).await)
+    #[pyo3(signature = (selector, timeout_ms=10000, force=false))]
+    fn double_click<'py>(&self, py: Python<'py>, selector: String, timeout_ms: u64, force: bool) -> PyResult<Bound<'py, PyAny>> {
+        fut!(py, self.inner, |t| t.click(&selector, "left", 2, timeout_ms, force).await)
     }
 
-    #[pyo3(signature = (selector, timeout_ms=10000))]
-    fn right_click<'py>(&self, py: Python<'py>, selector: String, timeout_ms: u64) -> PyResult<Bound<'py, PyAny>> {
-        fut!(py, self.inner, |t| t.click(&selector, "right", 1, timeout_ms).await)
+    #[pyo3(signature = (selector, timeout_ms=10000, force=false))]
+    fn right_click<'py>(&self, py: Python<'py>, selector: String, timeout_ms: u64, force: bool) -> PyResult<Bound<'py, PyAny>> {
+        fut!(py, self.inner, |t| t.click(&selector, "right", 1, timeout_ms, force).await)
     }
 
     #[pyo3(signature = (text, exact=false, timeout_ms=10000))]
@@ -2159,9 +2213,114 @@ impl PyTab {
         m.call_method1("RequestStream", (slf, url_pattern))
     }
 
-    fn locator<'py>(slf: Py<Self>, py: Python<'py>, query: String) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (query, strict=false))]
+    fn locator<'py>(slf: Py<Self>, py: Python<'py>, query: String, strict: bool) -> PyResult<Bound<'py, PyAny>> {
         let m = py.import("best_driver.locator")?;
-        m.call_method1("Locator", (slf, vec![query]))
+        m.call_method1("make_locator", (slf, query, strict))
+    }
+
+    fn frame_locator<'py>(slf: Py<Self>, py: Python<'py>, selector: String) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.locator")?;
+        m.call_method1("make_frame_locator", (slf, selector))
+    }
+
+    #[pyo3(signature = (role, *, name=None, exact=false, strict=false))]
+    fn get_by_role<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        role: String,
+        name: Option<String>,
+        exact: bool,
+        strict: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.locator")?;
+        m.call_method1("make_role_locator", (slf, role, name, exact, strict))
+    }
+
+    #[pyo3(signature = (text, *, exact=false, strict=false))]
+    fn get_by_text<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        text: String,
+        exact: bool,
+        strict: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.locator")?;
+        m.call_method1("make_text_locator", (slf, text, exact, strict))
+    }
+
+    #[pyo3(signature = (label, *, exact=false, strict=false))]
+    fn get_by_label<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        label: String,
+        exact: bool,
+        strict: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.locator")?;
+        m.call_method1("make_label_locator", (slf, label, exact, strict))
+    }
+
+    #[pyo3(signature = (placeholder, *, exact=false, strict=false))]
+    fn get_by_placeholder<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        placeholder: String,
+        exact: bool,
+        strict: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.locator")?;
+        m.call_method1("make_placeholder_locator", (slf, placeholder, exact, strict))
+    }
+
+    #[pyo3(signature = (test_id, *, attribute="data-testid".to_string(), strict=false))]
+    fn get_by_test_id<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        test_id: String,
+        attribute: String,
+        strict: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.locator")?;
+        m.call_method1("make_test_id_locator", (slf, test_id, attribute, strict))
+    }
+
+    #[pyo3(signature = (*, screenshots=true, network=true, console=false, page_errors=false, screenshot_interval_ms=1000))]
+    fn start_tracing<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        screenshots: bool,
+        network: bool,
+        console: bool,
+        page_errors: bool,
+        screenshot_interval_ms: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.tracing")?;
+        m.call_method1(
+            "start_tracing",
+            (slf, screenshots, network, console, page_errors, screenshot_interval_ms),
+        )
+    }
+
+    #[pyo3(signature = (label="snapshot".to_string()))]
+    fn trace_snapshot<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        label: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = py.import("best_driver.tracing")?;
+        m.call_method1("trace_snapshot", (slf, label))
+    }
+
+    #[pyo3(signature = (path=None))]
+    fn stop_tracing<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        path: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let p = py_to_opt_path(path)?;
+        let m = py.import("best_driver.tracing")?;
+        m.call_method1("stop_tracing", (slf, p))
     }
 }
 
@@ -2603,7 +2762,7 @@ impl PyBrowser {
 /// Launch a browser over a single flattened browser-level CDP WebSocket.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (headless=false, user_data_dir=None, browser_path=None, extra_args=None, proxy=None, keep_open=false, start_url=None))]
+#[pyo3(signature = (headless=false, user_data_dir=None, browser_path=None, extra_args=None, proxy=None, keep_open=false, start_url=None, stealth="standard".to_string()))]
 fn start<'py>(
     py: Python<'py>,
     headless: bool,
@@ -2613,9 +2772,11 @@ fn start<'py>(
     proxy: Option<String>,
     keep_open: bool,
     start_url: Option<String>,
+    stealth: String,
 ) -> PyResult<Bound<'py, PyAny>> {
     let data_dir = py_to_opt_path(user_data_dir)?;
     let bin_path = py_to_opt_path(browser_path)?;
+    let stealth_mode = StealthMode::parse(&stealth).map_err(rt)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let core = BrowserCore::launch(
             headless,
@@ -2625,6 +2786,7 @@ fn start<'py>(
             proxy,
             keep_open,
             start_url,
+            stealth_mode,
         )
         .await
         .map_err(rt)?;

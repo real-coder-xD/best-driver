@@ -2,6 +2,18 @@
 
 All notable changes to `best-driver` are documented in this file.
 
+## [0.4.0] - 2026-11-26
+
+### Added
+- **Stealth Engine v2 (`start(..., stealth="standard"|"minimal"|"aggressive"|"off")`)**:
+  - Upgraded default `"standard"` stealth to lazy, non-destructive patching: leaves V8's genuine C++ `Navigator.prototype.webdriver` getter untouched when `--disable-blink-features=AutomationControlled` already reports `false` (passing cross-realm `iframe.contentWindow.Function.prototype.toString` CreepJS lie-detectors with zero lies), preserves real hardware WebGL GPUs (replacing only SwiftShader/llvmpipe software renderers with OS-matched GPU profiles), and moves Canvas/Audio micro-noise into opt-in `stealth="aggressive"`.
+  - Added `stealth="minimal"` (Patchright-grade zero-injected-JS stealth: pure C++ flags, zero `Runtime.enable`, headless UA/Client Hints override, and CDP `pierce: true`).
+- **Playwright-Grade Actionability Engine (`click(..., force=False)`)**: `tab.click()`, `el.click()`, and `loc.click()` now verify visibility, enabled state (`!disabled`, `aria-disabled !== "true"`), 2-frame bounding-box stability (preventing layout-shift missed clicks), and Shadow-DOM-aware `elementFromPoint` hit-testing (waiting for temporary modals/overlays to clear) before firing Bézier clicks; pass `force=True` to bypass when needed.
+- **Playwright Semantic ARIA Locators & Strict Mode**: Added native Rust/JS `role:`, `label:`, and exact `text=:` support plus `get_by_role()`, `get_by_text()`, `get_by_label()`, `get_by_placeholder()`, `get_by_test_id()` across `Tab`, `Locator`, and `FrameLocator`, along with `strict=True` single-match enforcement (`with_strict()`).
+- **Lazy Auto-Retrying `FrameLocator` (`tab.frame_locator(selector)`)**: Re-resolves `<iframe>` chains (including nested iframes) on every action so interactions survive full iframe reloads and SPA re-mounts without stale handle errors.
+- **Self-Contained Interactive Trace Viewer (`tab.start_tracing()`, `tab.trace_snapshot()`, `tab.stop_tracing("trace.html")`)**: Records timestamped network waterfall, filmstrip screenshots, navigations, and optional console/page errors, exporting a standalone dark-mode single-file interactive HTML Trace Viewer (or JSON) with zero-leak session/context eviction.
+- **Automated E2E Chromium `pytest` Suite & CI Verification (`tests/`, `.github/workflows/CI.yml`)**: Added structured local-server `pytest` suites covering Stealth v2, Actionability/ARIA/FrameLocator, Routing/HAR/Tracing, and Lifecycle/Cleanup, wired directly into GitHub Actions CI.
+
 ## [0.3.4] - 2026-11-26
 
 ### Changed

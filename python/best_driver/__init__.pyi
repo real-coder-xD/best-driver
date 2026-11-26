@@ -24,6 +24,35 @@ ImageFormat = Literal["png", "jpeg", "jpg", "webp"]
 RouteStage = Literal["request", "response"]
 LocatorState = Literal["attached", "visible", "hidden", "detached"]
 WindowState = Literal["normal", "minimized", "maximized", "fullscreen"]
+StealthMode = Literal["standard", "minimal", "aggressive", "off"]
+AriaRole = Literal[
+    "button",
+    "link",
+    "textbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "listbox",
+    "option",
+    "heading",
+    "listitem",
+    "list",
+    "navigation",
+    "main",
+    "form",
+    "dialog",
+    "table",
+    "row",
+    "cell",
+    "columnheader",
+    "img",
+    "tab",
+    "menuitem",
+    "searchbox",
+    "spinbutton",
+    "slider",
+    "progressbar",
+]
 PermissionName = Literal[
     "geolocation",
     "notifications",
@@ -269,8 +298,13 @@ class Element:
         """Return captured metadata as a plain Python dictionary."""
         ...
 
-    async def click(self, button: MouseButton = "left", click_count: int = 1) -> None:
-        """Move cursor along a Cubic Bézier trajectory to this element and click."""
+    async def click(
+        self,
+        button: MouseButton = "left",
+        click_count: int = 1,
+        force: bool = False,
+    ) -> None:
+        """Check actionability (visible, enabled, stable, unobscured unless `force=True`), move along a Cubic Bézier trajectory, and click."""
         ...
 
     async def hover(self) -> None:
@@ -523,16 +557,27 @@ class Tab:
         button: MouseButton = "left",
         click_count: int = 1,
         timeout_ms: int = 10000,
+        force: bool = False,
     ) -> None:
-        """Wait for `selector`, move along a Cubic Bézier arc, and click."""
+        """Wait until `selector` is visible, enabled, layout-stable, and unobscured (unless `force=True`), then move along a Cubic Bézier arc and click."""
         ...
 
-    async def double_click(self, selector: str, timeout_ms: int = 10000) -> None:
-        """Double-click the matched element."""
+    async def double_click(
+        self,
+        selector: str,
+        timeout_ms: int = 10000,
+        force: bool = False,
+    ) -> None:
+        """Double-click the matched element with full actionability checks."""
         ...
 
-    async def right_click(self, selector: str, timeout_ms: int = 10000) -> None:
-        """Right-click the matched element."""
+    async def right_click(
+        self,
+        selector: str,
+        timeout_ms: int = 10000,
+        force: bool = False,
+    ) -> None:
+        """Right-click the matched element with full actionability checks."""
         ...
 
     async def click_text(
@@ -1004,8 +1049,83 @@ class Tab:
         """Open a stealth-safe async stream of renderer crash events (`Inspector.targetCrashed`)."""
         ...
 
-    def locator(self, query: str) -> Locator:
+    def locator(self, query: str, strict: bool = False) -> Locator:
         """Create a lazy, auto-retrying Smart Locator chain resilient to SPA DOM re-renders."""
+        ...
+
+    def frame_locator(self, selector: str) -> FrameLocator:
+        """Create a lazy, auto-retrying `FrameLocator` that re-resolves `<iframe>` handles across reloads."""
+        ...
+
+    def get_by_role(
+        self,
+        role: Union[AriaRole, str],
+        *,
+        name: Optional[str] = None,
+        exact: bool = False,
+        strict: bool = False,
+    ) -> Locator:
+        """Create a Playwright-style ARIA role locator (explicit `role=` and implicit HTML semantics)."""
+        ...
+
+    def get_by_text(
+        self,
+        text: str,
+        *,
+        exact: bool = False,
+        strict: bool = False,
+    ) -> Locator:
+        """Create a visible-text locator (substring by default, or exact match with `exact=True`)."""
+        ...
+
+    def get_by_label(
+        self,
+        label: str,
+        *,
+        exact: bool = False,
+        strict: bool = False,
+    ) -> Locator:
+        """Create a form-control locator matched by associated `<label>` or `aria-label`."""
+        ...
+
+    def get_by_placeholder(
+        self,
+        placeholder: str,
+        *,
+        exact: bool = False,
+        strict: bool = False,
+    ) -> Locator:
+        """Create an input/textarea locator matched by `placeholder` (pierces open & closed Shadow DOM)."""
+        ...
+
+    def get_by_test_id(
+        self,
+        test_id: str,
+        *,
+        attribute: str = "data-testid",
+        strict: bool = False,
+    ) -> Locator:
+        """Create a locator matched by `data-testid` (or custom attribute; pierces open & closed Shadow DOM)."""
+        ...
+
+    async def start_tracing(
+        self,
+        *,
+        screenshots: bool = True,
+        network: bool = True,
+        console: bool = False,
+        page_errors: bool = False,
+        screenshot_interval_ms: int = 1000,
+    ) -> TraceRecorder:
+        """Start recording a live timeline trace (network waterfall, screenshots, optional console/errors)."""
+        ...
+
+    async def trace_snapshot(self, label: str = "snapshot") -> Optional[dict[str, Any]]:
+        """Capture an immediate labeled screenshot + URL snapshot into the active trace."""
+        ...
+
+    async def stop_tracing(self, path: Optional[PathLike] = None) -> dict[str, Any]:
+        """Stop tracing and optionally export a standalone interactive HTML Trace Viewer (`.html`) or `.json`."""
         ...
 
 
@@ -1315,7 +1435,33 @@ class Locator:
     """Playwright-style lazy, auto-retrying Smart Locator chain."""
 
     def locator(self, query: str) -> Locator:
-        """Chain a descendant Smart Locator query (CSS, XPath, `text:`, `@attr`, open/closed Shadow DOM)."""
+        """Chain a descendant Smart Locator query (CSS, XPath, `text:`, `@attr`, `role:`, `label:`, open/closed Shadow DOM)."""
+        ...
+
+    def get_by_role(
+        self,
+        role: Union[AriaRole, str],
+        *,
+        name: Optional[str] = None,
+        exact: bool = False,
+    ) -> Locator:
+        """Chain an ARIA role locator (`button`, `link`, `textbox`, `checkbox`, etc.)."""
+        ...
+
+    def get_by_text(self, text: str, *, exact: bool = False) -> Locator:
+        """Chain a visible-text locator (substring or `exact=True`)."""
+        ...
+
+    def get_by_label(self, label: str, *, exact: bool = False) -> Locator:
+        """Chain a form-control locator matched by associated `<label>` or `aria-label`."""
+        ...
+
+    def get_by_placeholder(self, placeholder: str, *, exact: bool = False) -> Locator:
+        """Chain an input/textarea locator matched by `placeholder`."""
+        ...
+
+    def get_by_test_id(self, test_id: str, *, attribute: str = "data-testid") -> Locator:
+        """Chain a locator matched by `data-testid` (or custom attribute)."""
         ...
 
     def filter(
@@ -1339,6 +1485,10 @@ class Locator:
 
     def nth(self, index: int) -> Locator:
         """Select the `index`-th match (supports negative indexing) at the current step."""
+        ...
+
+    def with_strict(self, strict: bool = True) -> Locator:
+        """Return a copy of this locator with strict single-match enforcement enabled/disabled."""
         ...
 
     async def element(self, timeout_ms: int = 10000) -> Optional[Element]:
@@ -1382,15 +1532,16 @@ class Locator:
         button: MouseButton = "left",
         click_count: int = 1,
         timeout_ms: int = 10000,
+        force: bool = False,
     ) -> None:
-        """Re-resolve and click along a Cubic Bézier trajectory, retrying transient stale DOM errors."""
+        """Re-resolve, verify actionability (unless `force=True`), and click along a Cubic Bézier trajectory."""
         ...
 
-    async def double_click(self, timeout_ms: int = 10000) -> None:
+    async def double_click(self, timeout_ms: int = 10000, force: bool = False) -> None:
         """Re-resolve and double-click the matched element."""
         ...
 
-    async def right_click(self, timeout_ms: int = 10000) -> None:
+    async def right_click(self, timeout_ms: int = 10000, force: bool = False) -> None:
         """Re-resolve and right-click the matched element."""
         ...
 
@@ -1452,6 +1603,77 @@ class Locator:
 
     async def screenshot(self, file_path: Optional[PathLike] = None, timeout_ms: int = 10000) -> bytes:
         """Re-resolve and capture a PNG screenshot clipped to this element (optionally saving to `file_path`)."""
+        ...
+
+
+class FrameLocator:
+    """Lazy, auto-retrying iframe locator chain resilient to iframe reloads and SPA re-mounts."""
+
+    def frame_locator(self, selector: str) -> FrameLocator:
+        """Chain a nested `<iframe>` selector inside this frame."""
+        ...
+
+    def locator(self, query: str, *, strict: bool = False) -> Locator:
+        """Create a lazy `Locator` scoped to this iframe chain."""
+        ...
+
+    def get_by_role(
+        self,
+        role: Union[AriaRole, str],
+        *,
+        name: Optional[str] = None,
+        exact: bool = False,
+        strict: bool = False,
+    ) -> Locator:
+        """Locate an element by ARIA role and optional accessible name inside this iframe."""
+        ...
+
+    def get_by_text(self, text: str, *, exact: bool = False, strict: bool = False) -> Locator:
+        """Locate an element by visible text inside this iframe."""
+        ...
+
+    def get_by_label(self, label: str, *, exact: bool = False, strict: bool = False) -> Locator:
+        """Locate a form control by its `<label>` or `aria-label` inside this iframe."""
+        ...
+
+    def get_by_placeholder(
+        self,
+        placeholder: str,
+        *,
+        exact: bool = False,
+        strict: bool = False,
+    ) -> Locator:
+        """Locate an input/textarea by its `placeholder` inside this iframe."""
+        ...
+
+    def get_by_test_id(
+        self,
+        test_id: str,
+        *,
+        attribute: str = "data-testid",
+        strict: bool = False,
+    ) -> Locator:
+        """Locate an element by `data-testid` (or custom attribute) inside this iframe."""
+        ...
+
+
+class TraceRecorder:
+    """Background trace recorder capturing timeline events, network waterfall, and screenshots."""
+
+    started_at: str
+    events: list[dict[str, Any]]
+    snapshots: list[dict[str, Any]]
+
+    async def capture_snapshot(self, label: str = "snapshot") -> dict[str, Any]:
+        """Capture an immediate labeled screenshot + URL snapshot."""
+        ...
+
+    async def stop(self) -> dict[str, Any]:
+        """Stop recording and return the structured trace dictionary."""
+        ...
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a snapshot dictionary of all recorded trace events and screenshots."""
         ...
 
 
@@ -1588,6 +1810,7 @@ async def start(
     proxy: Optional[str] = None,
     keep_open: bool = False,
     start_url: Optional[str] = None,
+    stealth: StealthMode = "standard",
 ) -> Browser:
     """Launch Chromium over a single flattened browser-level CDP WebSocket.
 
@@ -1598,7 +1821,8 @@ async def start(
         extra_args: Additional Chromium command-line flags.
         proxy: Proxy URL (`"http://host:port"`, `"http://user:pass@host:port"`, `"socks5://host:port"`).
         keep_open: Keep Chromium running independently after `stop()`, `async with`, or Python exit.
-        start_url: Optional initial URL argument passed to Chromium (`None` skips `about:blank` by default; pass `"about:blank"` or `"https://..."` to open a specific page on launch).
+        start_url: Optional initial URL argument passed to Chromium (`None` skips `about:blank` by default).
+        stealth: Stealth profile — `"standard"` (zero-lie lazy prototype stealth + OS-consistent WebGL fallback), `"minimal"` (pure C++ flags + zero injected JS, Patchright-grade), `"aggressive"` (adds Canvas/Audio micro-noise), or `"off"`.
     """
     ...
 
@@ -1677,6 +1901,7 @@ async def sync_from_tls(
 
 
 __all__ = [
+    "AriaRole",
     "Browser",
     "BrowserContext",
     "BrowserFingerprint",
@@ -1693,6 +1918,7 @@ __all__ = [
     "EventStream",
     "FetchResponse",
     "FrameInfo",
+    "FrameLocator",
     "HarRecorder",
     "ImageFormat",
     "LoadedStorageState",
@@ -1712,10 +1938,12 @@ __all__ = [
     "RouteHandler",
     "RouteStage",
     "SpecialKey",
+    "StealthMode",
     "StorageState",
     "StreamedRequest",
     "StreamedResponse",
     "Tab",
+    "TraceRecorder",
     "ViewportSize",
     "WaitUntil",
     "WindowBounds",

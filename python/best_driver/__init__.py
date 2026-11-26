@@ -10,7 +10,7 @@ from .events import (
     PopupExpectation,
     PopupStream,
 )
-from .locator import Locator
+from .locator import FrameLocator, Locator
 from .network import (
     HarRecorder,
     RequestStream,
@@ -20,6 +20,7 @@ from .network import (
     StreamedResponse,
 )
 from .tls import sync_from_tls, tls_session
+from .tracing import TraceRecorder
 
 __all__ = [
     "Browser",
@@ -31,6 +32,7 @@ __all__ = [
     "CrashStream",
     "Element",
     "EventStream",
+    "FrameLocator",
     "HarRecorder",
     "Locator",
     "PageError",
@@ -43,6 +45,7 @@ __all__ = [
     "StreamedRequest",
     "StreamedResponse",
     "Tab",
+    "TraceRecorder",
     "cleanup",
     "connect",
     "start",

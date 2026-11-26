@@ -68,11 +68,15 @@ pub fn split_locator_branches(selector: &str) -> Vec<&str> {
         branches.push(tail);
     }
 
-    if branches.len() > 1 && (s.starts_with("text:") || s.starts_with("t:")) {
+    if branches.len() > 1 && (s.starts_with("text:") || s.starts_with("t:") || s.starts_with("text=:") || s.starts_with("label:") || s.starts_with("label=:")) {
         let has_explicit_branch = branches[1..].iter().any(|b| {
             b.starts_with('@')
                 || b.starts_with("text:")
                 || b.starts_with("t:")
+                || b.starts_with("text=:")
+                || b.starts_with("role:")
+                || b.starts_with("label:")
+                || b.starts_with("label=:")
                 || b.starts_with("//")
                 || b.starts_with("(//")
                 || b.starts_with(".//")
@@ -94,12 +98,64 @@ fn is_xpath(s: &str) -> bool {
 }
 
 #[inline]
-fn strip_text_prefix(s: &str) -> Option<&str> {
-    s.strip_prefix("text:").or_else(|| s.strip_prefix("t:"))
+fn strip_text_prefix(s: &str) -> Option<(&str, bool)> {
+    if let Some(rest) = s.strip_prefix("text=:") {
+        Some((rest, true))
+    } else if let Some(rest) = s.strip_prefix("text:").or_else(|| s.strip_prefix("t:")) {
+        Some((rest, false))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn strip_label_prefix(s: &str) -> Option<(&str, bool)> {
+    if let Some(rest) = s.strip_prefix("label=:") {
+        Some((rest, true))
+    } else if let Some(rest) = s.strip_prefix("label:") {
+        Some((rest, false))
+    } else {
+        None
+    }
+}
+
+/// Parses `role:button`, `role:button[name="Submit"]`, or `role:button[name="Submit" exact]`
+fn parse_role_query(s: &str) -> Option<(String, Option<String>, bool)> {
+    let rest = s.strip_prefix("role:")?.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some((role_part, bracket)) = rest.split_once('[') {
+        let role = role_part.trim().to_ascii_lowercase();
+        let inner = bracket.trim().strip_suffix(']')?.trim();
+        let mut exact = false;
+        let mut inner_clean = inner;
+        if let Some(before) = inner_clean.strip_suffix("exact") {
+            exact = true;
+            inner_clean = before.trim();
+        }
+        let name = if let Some((_, val)) = inner_clean.split_once('=') {
+            let v = val.trim();
+            let unquoted = v
+                .strip_prefix('"')
+                .and_then(|x| x.strip_suffix('"'))
+                .or_else(|| v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+                .unwrap_or(v);
+            Some(unquoted.replace("\\\"", "\"").replace("\\\\", "\\"))
+        } else {
+            None
+        };
+        return Some((role, name, exact));
+    }
+    Some((rest.to_ascii_lowercase(), None, false))
 }
 
 fn branch_to_css(b: &str) -> Option<String> {
-    if is_xpath(b) || strip_text_prefix(b).is_some() {
+    if is_xpath(b)
+        || strip_text_prefix(b).is_some()
+        || strip_label_prefix(b).is_some()
+        || parse_role_query(b).is_some()
+    {
         None
     } else if let Some(attr_part) = b.strip_prefix('@') {
         Some(attr_to_css(attr_part))
@@ -107,6 +163,123 @@ fn branch_to_css(b: &str) -> Option<String> {
         Some(b.to_string())
     }
 }
+
+const SEMANTIC_JS_HELPERS: &str = r#"
+function __bdImplicitRole(el) {
+    const explicit = (el.getAttribute && el.getAttribute('role') || '').trim().toLowerCase();
+    if (explicit) return explicit;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'button') return 'button';
+    if (tag === 'a' && el.hasAttribute('href')) return 'link';
+    if (tag === 'area' && el.hasAttribute('href')) return 'link';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'select') return el.multiple || (el.size && el.size > 1) ? 'listbox' : 'combobox';
+    if (tag === 'img') return 'img';
+    if (tag === 'li') return 'listitem';
+    if (tag === 'ul' || tag === 'ol') return 'list';
+    if (tag === 'nav') return 'navigation';
+    if (tag === 'main') return 'main';
+    if (tag === 'form') return 'form';
+    if (tag === 'dialog') return 'dialog';
+    if (tag === 'table') return 'table';
+    if (tag === 'tr') return 'row';
+    if (tag === 'td') return 'cell';
+    if (tag === 'th') return 'columnheader';
+    if (tag === 'option') return 'option';
+    if (tag === 'progress') return 'progressbar';
+    if (/^h[1-6]$/.test(tag)) return 'heading';
+    if (tag === 'input') {
+        const tp = (el.type || 'text').toLowerCase();
+        if (tp === 'button' || tp === 'submit' || tp === 'reset' || tp === 'image') return 'button';
+        if (tp === 'checkbox') return 'checkbox';
+        if (tp === 'radio') return 'radio';
+        if (tp === 'search') return 'searchbox';
+        if (tp === 'number') return 'spinbutton';
+        if (tp === 'range') return 'slider';
+        if (tp === 'hidden') return '';
+        return 'textbox';
+    }
+    if (el.getAttribute && el.getAttribute('contenteditable') === 'true') return 'textbox';
+    return '';
+}
+function __bdAccName(el) {
+    const doc = el.ownerDocument || document;
+    const al = el.getAttribute && el.getAttribute('aria-label');
+    if (al) return al.trim();
+    const lb = el.getAttribute && el.getAttribute('aria-labelledby');
+    if (lb) {
+        const txt = lb.split(/\s+/).map(id => {
+            const ref = doc.getElementById(id);
+            return ref ? (ref.innerText || ref.textContent || '').trim() : '';
+        }).filter(Boolean).join(' ').trim();
+        if (txt) return txt;
+    }
+    if (el.labels && el.labels.length) {
+        const lt = Array.from(el.labels).map(l => (l.innerText || l.textContent || '').trim()).filter(Boolean).join(' ').trim();
+        if (lt) return lt;
+    }
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'input' && (el.type === 'button' || el.type === 'submit' || el.type === 'reset') && el.value) {
+        return String(el.value).trim();
+    }
+    if (tag === 'img' && el.alt) return el.alt.trim();
+    const inner = (el.innerText || el.textContent || '').trim();
+    if (inner) return inner;
+    const ph = el.getAttribute && el.getAttribute('placeholder');
+    if (ph) return ph.trim();
+    const title = el.getAttribute && el.getAttribute('title');
+    return title ? title.trim() : '';
+}
+function __bdMatchRoleAll(rootNode, wantRole, wantName, exact) {
+    const out = [];
+    const seen = new Set();
+    const wantLow = wantName !== null ? wantName.trim().toLowerCase() : null;
+    function walk(root) {
+        for (const el of root.querySelectorAll('*')) {
+            if (el.shadowRoot) walk(el.shadowRoot);
+            if (__bdImplicitRole(el) !== wantRole) continue;
+            if (wantLow !== null) {
+                const nm = __bdAccName(el).toLowerCase();
+                if (exact ? nm !== wantLow : !nm.includes(wantLow)) continue;
+            }
+            if (!seen.has(el)) { seen.add(el); out.push(el); }
+        }
+    }
+    walk(rootNode);
+    if (rootNode.shadowRoot) walk(rootNode.shadowRoot);
+    return out;
+}
+function __bdMatchLabelAll(rootNode, wantLabel, exact) {
+    const out = [];
+    const seen = new Set();
+    const add = (el) => { if (el && el.nodeType === 1 && !seen.has(el)) { seen.add(el); out.push(el); } };
+    const wantLow = wantLabel.trim().toLowerCase();
+    const matchStr = (s) => { const low = (s || '').trim().toLowerCase(); return exact ? low === wantLow : low.includes(wantLow); };
+    function walk(root) {
+        for (const el of root.querySelectorAll('*')) {
+            if (el.shadowRoot) walk(el.shadowRoot);
+            const tag = (el.tagName || '').toLowerCase();
+            if (tag === 'label') {
+                const txt = (el.innerText || el.textContent || '').trim();
+                if (matchStr(txt)) {
+                    if (el.control) add(el.control);
+                    else {
+                        const forId = el.getAttribute('for');
+                        const target = forId ? (root.getElementById ? root.getElementById(forId) : document.getElementById(forId)) : el.querySelector('input,textarea,select');
+                        if (target) add(target);
+                    }
+                }
+            } else {
+                const al = el.getAttribute && el.getAttribute('aria-label');
+                if (al && matchStr(al)) add(el);
+            }
+        }
+    }
+    walk(rootNode);
+    if (rootNode.shadowRoot) walk(rootNode.shadowRoot);
+    return out;
+}
+"#;
 
 fn sel_single_expr(s: &str) -> String {
     if is_xpath(s) {
@@ -117,17 +290,36 @@ fn sel_single_expr(s: &str) -> String {
             }})()",
             js_str(s)
         )
-    } else if let Some(txt) = strip_text_prefix(s) {
+    } else if let Some((role, name, exact)) = parse_role_query(s) {
+        let name_js = match name {
+            Some(ref n) => js_str(n),
+            None => "null".to_string(),
+        };
+        format!(
+            "(() => {{ {} const arr = __bdMatchRoleAll(document, {}, {}, {}); return arr[0] || null; }})()",
+            SEMANTIC_JS_HELPERS,
+            js_str(&role),
+            name_js,
+            exact
+        )
+    } else if let Some((lbl, exact)) = strip_label_prefix(s) {
+        format!(
+            "(() => {{ {} const arr = __bdMatchLabelAll(document, {}, {}); return arr[0] || null; }})()",
+            SEMANTIC_JS_HELPERS,
+            js_str(lbl),
+            exact
+        )
+    } else if let Some((txt, exact)) = strip_text_prefix(s) {
         format!(
             "(() => {{ \
-                const target = {}.trim().toLowerCase(); \
+                const target = {}.trim().toLowerCase(); const exact = {}; \
                 let best = null; \
                 function walk(root) {{ \
                     for (const el of root.querySelectorAll('*')) {{ \
                         if (el.shadowRoot) walk(el.shadowRoot); \
                         if (el.getClientRects().length === 0) continue; \
                         const c = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase(); \
-                        if (c.includes(target)) {{ \
+                        if (exact ? c === target : c.includes(target)) {{ \
                             if (!best || best.contains(el)) best = el; \
                         }} \
                     }} \
@@ -135,7 +327,7 @@ fn sel_single_expr(s: &str) -> String {
                 walk(document); \
                 return best; \
             }})()",
-            js_str(txt)
+            js_str(txt), exact
         )
     } else {
         let css_sel = branch_to_css(s).unwrap_or_else(|| s.to_string());
@@ -174,23 +366,42 @@ fn sel_single_all_expr(s: &str) -> String {
             }})()",
             js_str(s)
         )
-    } else if let Some(txt) = strip_text_prefix(s) {
+    } else if let Some((role, name, exact)) = parse_role_query(s) {
+        let name_js = match name {
+            Some(ref n) => js_str(n),
+            None => "null".to_string(),
+        };
+        format!(
+            "(() => {{ {} return __bdMatchRoleAll(document, {}, {}, {}); }})()",
+            SEMANTIC_JS_HELPERS,
+            js_str(&role),
+            name_js,
+            exact
+        )
+    } else if let Some((lbl, exact)) = strip_label_prefix(s) {
+        format!(
+            "(() => {{ {} return __bdMatchLabelAll(document, {}, {}); }})()",
+            SEMANTIC_JS_HELPERS,
+            js_str(lbl),
+            exact
+        )
+    } else if let Some((txt, exact)) = strip_text_prefix(s) {
         format!(
             "(() => {{ \
-                const target = {}.trim().toLowerCase(); \
+                const target = {}.trim().toLowerCase(); const exact = {}; \
                 const list = []; \
                 function walk(root) {{ \
                     for (const el of root.querySelectorAll('*')) {{ \
                         if (el.shadowRoot) walk(el.shadowRoot); \
                         if (el.getClientRects().length === 0) continue; \
                         const c = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase(); \
-                        if (c.includes(target)) list.push(el); \
+                        if (exact ? c === target : c.includes(target)) list.push(el); \
                     }} \
                 }} \
                 walk(document); \
                 return list; \
             }})()",
-            js_str(txt)
+            js_str(txt), exact
         )
     } else {
         let css_sel = branch_to_css(s).unwrap_or_else(|| s.to_string());
@@ -410,13 +621,136 @@ const CHILD_MIXED_ALL_FN: &str = "function(branches) { \
     return out; \
 }";
 
+const CHILD_ROLE_ONE_FN: &str = r#"function(spec) {
+    function __bdImplicitRole(el) {
+        const explicit = (el.getAttribute && el.getAttribute('role') || '').trim().toLowerCase();
+        if (explicit) return explicit;
+        const tag = (el.tagName || '').toLowerCase();
+        if (tag === 'button') return 'button';
+        if ((tag === 'a' || tag === 'area') && el.hasAttribute('href')) return 'link';
+        if (tag === 'textarea') return 'textbox';
+        if (tag === 'select') return el.multiple || (el.size && el.size > 1) ? 'listbox' : 'combobox';
+        if (tag === 'img') return 'img';
+        if (tag === 'li') return 'listitem';
+        if (tag === 'ul' || tag === 'ol') return 'list';
+        if (tag === 'nav') return 'navigation';
+        if (tag === 'main') return 'main';
+        if (tag === 'form') return 'form';
+        if (tag === 'dialog') return 'dialog';
+        if (tag === 'table') return 'table';
+        if (tag === 'tr') return 'row';
+        if (tag === 'td') return 'cell';
+        if (tag === 'th') return 'columnheader';
+        if (tag === 'option') return 'option';
+        if (/^h[1-6]$/.test(tag)) return 'heading';
+        if (tag === 'input') {
+            const tp = (el.type || 'text').toLowerCase();
+            if (tp === 'button' || tp === 'submit' || tp === 'reset' || tp === 'image') return 'button';
+            if (tp === 'checkbox') return 'checkbox';
+            if (tp === 'radio') return 'radio';
+            if (tp === 'search') return 'searchbox';
+            if (tp === 'number') return 'spinbutton';
+            if (tp === 'range') return 'slider';
+            if (tp === 'hidden') return '';
+            return 'textbox';
+        }
+        if (el.getAttribute && el.getAttribute('contenteditable') === 'true') return 'textbox';
+        return '';
+    }
+    function __bdAccName(el) {
+        const doc = el.ownerDocument || document;
+        const al = el.getAttribute && el.getAttribute('aria-label');
+        if (al) return al.trim();
+        const lb = el.getAttribute && el.getAttribute('aria-labelledby');
+        if (lb) {
+            const txt = lb.split(/\s+/).map(id => { const r = doc.getElementById(id); return r ? (r.innerText || r.textContent || '').trim() : ''; }).filter(Boolean).join(' ').trim();
+            if (txt) return txt;
+        }
+        if (el.labels && el.labels.length) {
+            const lt = Array.from(el.labels).map(l => (l.innerText || l.textContent || '').trim()).filter(Boolean).join(' ').trim();
+            if (lt) return lt;
+        }
+        const tag = (el.tagName || '').toLowerCase();
+        if (tag === 'input' && (el.type === 'button' || el.type === 'submit' || el.type === 'reset') && el.value) return String(el.value).trim();
+        if (tag === 'img' && el.alt) return el.alt.trim();
+        const inner = (el.innerText || el.textContent || '').trim();
+        if (inner) return inner;
+        return (el.getAttribute && (el.getAttribute('placeholder') || el.getAttribute('title')) || '').trim();
+    }
+    const wantLow = spec.name !== null ? spec.name.trim().toLowerCase() : null;
+    const out = [];
+    function walk(root) {
+        for (const el of root.querySelectorAll('*')) {
+            if (el.shadowRoot) walk(el.shadowRoot);
+            if (__bdImplicitRole(el) !== spec.role) continue;
+            if (wantLow !== null) {
+                const nm = __bdAccName(el).toLowerCase();
+                if (spec.exact ? nm !== wantLow : !nm.includes(wantLow)) continue;
+            }
+            out.push(el);
+        }
+    }
+    walk(this);
+    if (this.shadowRoot) walk(this.shadowRoot);
+    return spec.all ? out : (out[0] || null);
+}"#;
+
+const CHILD_LABEL_FN: &str = r#"function(spec) {
+    const out = [];
+    const seen = new Set();
+    const add = (el) => { if (el && el.nodeType === 1 && !seen.has(el)) { seen.add(el); out.push(el); } };
+    const wantLow = spec.label.trim().toLowerCase();
+    const matchStr = (s) => { const low = (s || '').trim().toLowerCase(); return spec.exact ? low === wantLow : low.includes(wantLow); };
+    function walk(root) {
+        for (const el of root.querySelectorAll('*')) {
+            if (el.shadowRoot) walk(el.shadowRoot);
+            if ((el.tagName || '').toLowerCase() === 'label') {
+                if (matchStr(el.innerText || el.textContent || '')) {
+                    if (el.control) add(el.control);
+                    else {
+                        const forId = el.getAttribute('for');
+                        const target = forId ? (document.getElementById(forId)) : el.querySelector('input,textarea,select');
+                        if (target) add(target);
+                    }
+                }
+            } else {
+                const al = el.getAttribute && el.getAttribute('aria-label');
+                if (al && matchStr(al)) add(el);
+            }
+        }
+    }
+    walk(this);
+    if (this.shadowRoot) walk(this.shadowRoot);
+    return spec.all ? out : (out[0] || null);
+}"#;
+
+const CHILD_TEXT_EXACT_FN: &str = r#"function(spec) {
+    const target = spec.text.trim().toLowerCase();
+    const list = [];
+    let best = null;
+    function walk(root) {
+        for (const el of root.querySelectorAll('*')) {
+            if (el.shadowRoot) walk(el.shadowRoot);
+            if (el.getClientRects().length === 0) continue;
+            const c = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim().toLowerCase();
+            if (spec.exact ? c === target : c.includes(target)) {
+                list.push(el);
+                if (!best || best.contains(el)) best = el;
+            }
+        }
+    }
+    walk(this);
+    if (this.shadowRoot) walk(this.shadowRoot);
+    return spec.all ? list : best;
+}"#;
+
 fn encode_mixed_branches(branches: &[&str]) -> serde_json::Value {
     let items: Vec<serde_json::Value> = branches
         .iter()
         .map(|b| {
             if is_xpath(b) {
                 serde_json::json!({ "k": "xpath", "v": *b })
-            } else if let Some(txt) = strip_text_prefix(b) {
+            } else if let Some((txt, _)) = strip_text_prefix(b) {
                 serde_json::json!({ "k": "text", "v": txt })
             } else {
                 let css = branch_to_css(b).unwrap_or_else(|| (*b).to_string());
@@ -434,7 +768,23 @@ pub fn child_sel_fn(query: &str) -> (&'static str, serde_json::Value) {
         let s = branches[0];
         if is_xpath(s) {
             return (CHILD_XPATH_ONE_FN, serde_json::Value::String(s.to_string()));
-        } else if let Some(txt) = strip_text_prefix(s) {
+        } else if let Some((role, name, exact)) = parse_role_query(s) {
+            return (
+                CHILD_ROLE_ONE_FN,
+                serde_json::json!({ "role": role, "name": name, "exact": exact, "all": false }),
+            );
+        } else if let Some((lbl, exact)) = strip_label_prefix(s) {
+            return (
+                CHILD_LABEL_FN,
+                serde_json::json!({ "label": lbl, "exact": exact, "all": false }),
+            );
+        } else if let Some((txt, exact)) = strip_text_prefix(s) {
+            if exact {
+                return (
+                    CHILD_TEXT_EXACT_FN,
+                    serde_json::json!({ "text": txt, "exact": true, "all": false }),
+                );
+            }
             return (CHILD_TEXT_ONE_FN, serde_json::Value::String(txt.to_string()));
         } else {
             let css = branch_to_css(s).unwrap_or_else(|| s.to_string());
@@ -454,7 +804,23 @@ pub fn child_sel_all_fn(query: &str) -> (&'static str, serde_json::Value) {
         let s = branches[0];
         if is_xpath(s) {
             return (CHILD_XPATH_ALL_FN, serde_json::Value::String(s.to_string()));
-        } else if let Some(txt) = strip_text_prefix(s) {
+        } else if let Some((role, name, exact)) = parse_role_query(s) {
+            return (
+                CHILD_ROLE_ONE_FN,
+                serde_json::json!({ "role": role, "name": name, "exact": exact, "all": true }),
+            );
+        } else if let Some((lbl, exact)) = strip_label_prefix(s) {
+            return (
+                CHILD_LABEL_FN,
+                serde_json::json!({ "label": lbl, "exact": exact, "all": true }),
+            );
+        } else if let Some((txt, exact)) = strip_text_prefix(s) {
+            if exact {
+                return (
+                    CHILD_TEXT_EXACT_FN,
+                    serde_json::json!({ "text": txt, "exact": true, "all": true }),
+                );
+            }
             return (CHILD_TEXT_ALL_FN, serde_json::Value::String(txt.to_string()));
         } else {
             let css = branch_to_css(s).unwrap_or_else(|| s.to_string());
@@ -663,26 +1029,26 @@ fn find_pierced_single_branch(root: &serde_json::Value, s: &str, out: &mut Vec<i
         return;
     }
 
-    if let Some(txt) = strip_text_prefix(s) {
+    if let Some((txt, exact)) = strip_text_prefix(s) {
         let needle = txt.trim().to_lowercase();
-        fn walk_text(node: &serde_json::Value, needle: &str, out: &mut Vec<i64>) -> bool {
+        fn walk_text(node: &serde_json::Value, needle: &str, exact: bool, out: &mut Vec<i64>) -> bool {
             let mut child_matched = false;
             if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
                 for c in children {
-                    if walk_text(c, needle, out) {
+                    if walk_text(c, needle, exact, out) {
                         child_matched = true;
                     }
                 }
             }
             if let Some(shadows) = node.get("shadowRoots").and_then(|v| v.as_array()) {
                 for sr in shadows {
-                    if walk_text(sr, needle, out) {
+                    if walk_text(sr, needle, exact, out) {
                         child_matched = true;
                     }
                 }
             }
             if let Some(cd) = node.get("contentDocument") {
-                if walk_text(cd, needle, out) {
+                if walk_text(cd, needle, exact, out) {
                     child_matched = true;
                 }
             }
@@ -692,7 +1058,8 @@ fn find_pierced_single_branch(root: &serde_json::Value, s: &str, out: &mut Vec<i
             if node.get("nodeType").and_then(|v| v.as_i64()) == Some(1) {
                 let mut text = String::new();
                 cdp_collect_text(node, &mut text);
-                if text.trim().to_lowercase().contains(needle) {
+                let low = text.trim().to_lowercase();
+                if if exact { low == needle } else { low.contains(needle) } {
                     if let Some(bid) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
                         if !out.contains(&bid) {
                             out.push(bid);
@@ -703,7 +1070,101 @@ fn find_pierced_single_branch(root: &serde_json::Value, s: &str, out: &mut Vec<i
             }
             false
         }
-        walk_text(root, &needle, out);
+        walk_text(root, &needle, exact, out);
+        return;
+    }
+
+    if let Some((want_role, want_name, exact)) = parse_role_query(s) {
+        fn cdp_implicit_role(node: &serde_json::Value) -> &'static str {
+            if let Some(r) = cdp_attr(node, "role") {
+                match r.trim().to_ascii_lowercase().as_str() {
+                    "button" => return "button",
+                    "link" => return "link",
+                    "textbox" => return "textbox",
+                    "checkbox" => return "checkbox",
+                    "radio" => return "radio",
+                    "combobox" => return "combobox",
+                    "heading" => return "heading",
+                    "listitem" => return "listitem",
+                    "tab" => return "tab",
+                    "dialog" => return "dialog",
+                    "menuitem" => return "menuitem",
+                    "img" => return "img",
+                    _ => {}
+                }
+            }
+            let tag = node
+                .get("localName")
+                .or_else(|| node.get("nodeName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            match tag.as_str() {
+                "button" => "button",
+                "a" | "area" if cdp_attr(node, "href").is_some() => "link",
+                "textarea" => "textbox",
+                "select" => "combobox",
+                "img" => "img",
+                "li" => "listitem",
+                "dialog" => "dialog",
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "heading",
+                "input" => match cdp_attr(node, "type").unwrap_or("text").to_ascii_lowercase().as_str() {
+                    "button" | "submit" | "reset" | "image" => "button",
+                    "checkbox" => "checkbox",
+                    "radio" => "radio",
+                    "search" => "searchbox",
+                    "hidden" => "",
+                    _ => "textbox",
+                },
+                _ => "",
+            }
+        }
+        fn walk_role(node: &serde_json::Value, want_role: &str, want_name: Option<&str>, exact: bool, out: &mut Vec<i64>) {
+            if node.get("nodeType").and_then(|v| v.as_i64()) == Some(1) {
+                let explicit = cdp_attr(node, "role").map(|r| r.trim().to_ascii_lowercase());
+                let matched_role = explicit.as_deref() == Some(want_role) || cdp_implicit_role(node) == want_role;
+                if matched_role {
+                    let name_ok = match want_name {
+                        None => true,
+                        Some(w) => {
+                            let w_low = w.trim().to_lowercase();
+                            let mut txt = String::new();
+                            cdp_collect_text(node, &mut txt);
+                            let cand = cdp_attr(node, "aria-label")
+                                .or_else(|| cdp_attr(node, "placeholder"))
+                                .or_else(|| cdp_attr(node, "alt"))
+                                .or_else(|| cdp_attr(node, "title"))
+                                .map(str::to_string)
+                                .unwrap_or(txt)
+                                .trim()
+                                .to_lowercase();
+                            if exact { cand == w_low } else { cand.contains(&w_low) }
+                        }
+                    };
+                    if name_ok {
+                        if let Some(bid) = node.get("backendNodeId").and_then(|v| v.as_i64()) {
+                            if !out.contains(&bid) {
+                                out.push(bid);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+                for c in children { walk_role(c, want_role, want_name, exact, out); }
+            }
+            if let Some(shadows) = node.get("shadowRoots").and_then(|v| v.as_array()) {
+                for sr in shadows { walk_role(sr, want_role, want_name, exact, out); }
+            }
+            if let Some(cd) = node.get("contentDocument") {
+                walk_role(cd, want_role, want_name, exact, out);
+            }
+        }
+        walk_role(root, &want_role, want_name.as_deref(), exact, out);
+        return;
+    }
+
+    if strip_label_prefix(s).is_some() {
         return;
     }
 

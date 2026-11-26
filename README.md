@@ -655,9 +655,19 @@ async with tab.listen_crashes() as crashes:
     alive = await tab.is_alive()
 ```
 
-### Permissions, OS Window Bounds, and Auto-Dialogs
+### Permissions, OS Window Bounds, Auto-Dialogs, Semantic Locators & Trace Viewer
 
 ```python
+# Playwright-grade semantic ARIA locators + lazy auto-retrying FrameLocator + Actionability
+await tab.get_by_label("Email").fill("bot@example.com")
+await tab.get_by_role("button", name="Sign In", exact=True).click()   # waits for stable + unobscured + enabled
+await tab.frame_locator("#checkout").get_by_test_id("pay-btn").click()
+
+# Self-contained interactive HTML Trace Viewer (filmstrip screenshots + network waterfall)
+await tab.start_tracing(screenshots=True, network=True, page_errors=True)
+await tab.trace_snapshot("after-login")
+await tab.stop_tracing("trace.html")  # open directly in any browser
+
 # Context-scoped permissions (Playwright aliases supported)
 await tab.grant_permissions(["clipboard-read", "clipboard-write", "notifications"])
 
@@ -785,10 +795,11 @@ async def start(
     proxy: Optional[str] = None,
     keep_open: bool = False,
     start_url: Optional[str] = None,
+    stealth: StealthMode = "standard",
 ) -> Browser
 ```
 
-Launches Chromium on an OS-assigned loopback debugging port, connects a single browser-level CDP WebSocket, strips `HeadlessChrome` UA/Client Hints if running headless, and arms `Target.setAutoAttach` for popups and OOPIFs. By default `start_url=None` skips appending `about:blank` (so Chromium opens its native New Tab page, respects persistent profile restore, and avoids duplicate blank tabs when URLs or `--no-startup-window` are passed); pass `start_url="about:blank"` or `start_url="https://..."` to open a specific page on launch. Set `keep_open=True` to leave Chromium running independently after `stop()`, `async with`, or Python exit.
+Launches Chromium on an OS-assigned loopback debugging port, connects a single browser-level CDP WebSocket, strips `HeadlessChrome` UA/Client Hints if running headless, and arms `Target.setAutoAttach` for popups and OOPIFs. By default `start_url=None` skips appending `about:blank` (so Chromium opens its native New Tab page, respects persistent profile restore, and avoids duplicate blank tabs when URLs or `--no-startup-window` are passed); pass `start_url="about:blank"` or `start_url="https://..."` to open a specific page on launch. `stealth` selects `"standard"` (zero-lie lazy prototype stealth + OS-consistent WebGL software fallback), `"minimal"` (zero injected JS, pure C++ flags + CDP), `"aggressive"` (adds Canvas/Audio micro-noise), or `"off"`. Set `keep_open=True` to leave Chromium running independently after `stop()`, `async with`, or Python exit.
 
 #### `best_driver.connect(...)`
 

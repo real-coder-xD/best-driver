@@ -1,14 +1,48 @@
-// src/evasion.js — Tier-1+ Native Prototype Stealth Evasion Script
+// src/evasion.js — Stealth Engine v2: Lazy, Non-Destructive Prototype Stealth
+// Design invariants:
+// 1. NEVER replace genuine C++ native getters/methods when Chromium already returns the authentic value
+//    (e.g. `navigator.webdriver === false` via `--disable-blink-features=AutomationControlled`),
+//    eliminating cross-realm `iframe.contentWindow.Function.prototype.toString` lie-detector flags.
+// 2. ONLY patch `Function.prototype.toString` lazily when a JS shim is actually installed.
+// 3. ONLY spoof WebGL vendor/renderer when a software renderer (SwiftShader/llvmpipe) is detected,
+//    choosing an OS-consistent GPU profile matching `navigator.userAgent` (no Direct3D11 on macOS/Linux).
+// 4. Keep `Object.getOwnPropertyNames(navigator)` and `Object.getOwnPropertyNames(navigator.permissions)` empty.
 (() => {
     'use strict';
 
-    // ───────────────────────────── 1. Core Native Engine ─────────────────────────────
-    // Tracks custom functions and makes them indistinguishable from V8 native methods/getters.
-    // All patched functions use concise method syntax so `'prototype' in fn === false` (non-constructable).
+    // ───────────────────────────── 1. Lazy Native Function Masker ─────────────────────────────
     const nativeFunctions = new WeakMap();
     const origToString = Function.prototype.toString;
+    let toStringPatched = false;
+
+    function ensureToStringPatched() {
+        if (toStringPatched) return;
+        toStringPatched = true;
+        const customToString = ({
+            toString() {
+                if (this === customToString) {
+                    return 'function toString() { [native code] }';
+                }
+                if (nativeFunctions.has(this)) {
+                    const name = nativeFunctions.get(this);
+                    return name ? `function ${name}() { [native code] }` : 'function () { [native code] }';
+                }
+                return origToString.call(this);
+            }
+        }).toString;
+        nativeFunctions.set(customToString, 'toString');
+        try {
+            Object.defineProperty(Function.prototype, 'toString', {
+                value: customToString,
+                writable: true,
+                configurable: true,
+                enumerable: false,
+            });
+        } catch (_) {}
+    }
 
     function makeNative(fn, name) {
+        ensureToStringPatched();
         const fnName = name !== undefined ? name : (fn.name || '');
         nativeFunctions.set(fn, fnName);
         try {
@@ -16,29 +50,6 @@
         } catch (_) {}
         return fn;
     }
-
-    const customToString = ({
-        toString() {
-            if (this === customToString) {
-                return 'function toString() { [native code] }';
-            }
-            if (nativeFunctions.has(this)) {
-                const name = nativeFunctions.get(this);
-                return name ? `function ${name}() { [native code] }` : 'function () { [native code] }';
-            }
-            return origToString.call(this);
-        }
-    }).toString;
-
-    makeNative(customToString, 'toString');
-    try {
-        Object.defineProperty(Function.prototype, 'toString', {
-            value: customToString,
-            writable: true,
-            configurable: true,
-            enumerable: false,
-        });
-    } catch (_) {}
 
     function defineProtoGetter(proto, prop, getterFn) {
         if (!proto) return;
@@ -54,13 +65,14 @@
 
     const navProto = Object.getPrototypeOf(navigator) || Navigator.prototype;
 
-    // ───────────────────────────── 2. Navigator.webdriver (Real Descriptor Spoofing) ─────────────────────────────
-    // In genuine Chrome:
-    // 1. 'webdriver' in Navigator.prototype === true
-    // 2. Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver').get returns false & has no .prototype
-    // 3. Object.getOwnPropertyNames(navigator).length === 0
+    // ───────────────────────────── 2. Navigator.webdriver (Zero-Lie Lazy Guard) ─────────────────────────────
+    // When `--disable-blink-features=AutomationControlled` is active, V8 already reports
+    // `navigator.webdriver === false` via its genuine C++ getter — leave it untouched so
+    // cross-realm `iframe.contentWindow.Function.prototype.toString.call(getter)` sees real native code.
     try {
-        defineProtoGetter(navProto, 'webdriver', () => false);
+        if (navigator.webdriver !== false) {
+            defineProtoGetter(navProto, 'webdriver', () => false);
+        }
         if (Object.prototype.hasOwnProperty.call(navigator, 'webdriver')) {
             delete navigator.webdriver;
         }
@@ -70,53 +82,55 @@
     if (!window.chrome) {
         window.chrome = {};
     }
+    if (!window.chrome.csi) {
+        window.chrome.csi = makeNative(({ csi() {} }).csi, 'csi');
+    }
+    if (!window.chrome.loadTimes) {
+        window.chrome.loadTimes = makeNative(({
+            loadTimes() {
+                const now = Date.now() / 1000;
+                return {
+                    commitLoadTime: now - 0.2,
+                    connectionInfo: 'h2',
+                    finishDocumentLoadTime: now - 0.05,
+                    finishLoadTime: now,
+                    firstPaintAfterLoadTime: 0,
+                    firstPaintTime: now - 0.15,
+                    navigationType: 'Other',
+                    requestTime: now - 0.3,
+                    startLoadTime: now - 0.3,
+                    wasAlternateProtocolAvailable: false,
+                    wasFetchedViaSpdy: true,
+                    wasNpnNegotiated: true,
+                    npnNegotiatedProtocol: 'h2'
+                };
+            }
+        }).loadTimes, 'loadTimes');
+    }
+    if (!window.chrome.app) {
+        window.chrome.app = {
+            isInstalled: false,
+            InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+            RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+            getDetails: makeNative(({ getDetails() { return null; } }).getDetails, 'getDetails'),
+            getIsInstalled: makeNative(({ getIsInstalled() { return false; } }).getIsInstalled, 'getIsInstalled'),
+            installState: makeNative(({ installState() { return 'not_installed'; } }).installState, 'installState'),
+        };
+    }
+    if (!window.chrome.runtime) {
+        window.chrome.runtime = {
+            PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+            PlatformArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' },
+            PlatformNaclArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' },
+            RequestUpdateCheckStatus: { THROTTLED: 'throttled', NO_UPDATE: 'no_update', UPDATE_AVAILABLE: 'update_available' },
+            OnInstalledReason: { INSTALL: 'install', UPDATE: 'update', CHROME_UPDATE: 'chrome_update', SHARED_MODULE_UPDATE: 'shared_module_update' },
+            OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+            connect: makeNative(({ connect() {} }).connect, 'connect'),
+            sendMessage: makeNative(({ sendMessage() {} }).sendMessage, 'sendMessage'),
+        };
+    }
 
-    const csiFn = makeNative(({ csi() {} }).csi, 'csi');
-    const loadTimesFn = makeNative(({
-        loadTimes() {
-            const now = Date.now() / 1000;
-            return {
-                commitLoadTime: now - 0.2,
-                connectionInfo: 'http/1.1',
-                finishDocumentLoadTime: now - 0.05,
-                finishLoadTime: now,
-                firstPaintAfterLoadTime: 0,
-                firstPaintTime: now - 0.15,
-                navigationType: 'Other',
-                requestTime: now - 0.3,
-                startLoadTime: now - 0.3,
-                wasAlternateProtocolAvailable: false,
-                wasFetchedViaSpdy: false,
-                wasNpnNegotiated: false,
-                npnNegotiatedProtocol: 'unknown'
-            };
-        }
-    }).loadTimes, 'loadTimes');
-
-    window.chrome.csi = window.chrome.csi || csiFn;
-    window.chrome.loadTimes = window.chrome.loadTimes || loadTimesFn;
-
-    window.chrome.app = window.chrome.app || {
-        isInstalled: false,
-        InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
-        RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
-        getDetails: makeNative(({ getDetails() { return null; } }).getDetails, 'getDetails'),
-        getIsInstalled: makeNative(({ getIsInstalled() { return false; } }).getIsInstalled, 'getIsInstalled'),
-        installState: makeNative(({ installState() { return 'not_installed'; } }).installState, 'installState'),
-    };
-
-    window.chrome.runtime = window.chrome.runtime || {
-        PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
-        PlatformArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' },
-        PlatformNaclArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' },
-        RequestUpdateCheckStatus: { THROTTLED: 'throttled', NO_UPDATE: 'no_update', UPDATE_AVAILABLE: 'update_available' },
-        OnInstalledReason: { INSTALL: 'install', UPDATE: 'update', CHROME_UPDATE: 'chrome_update', SHARED_MODULE_UPDATE: 'shared_module_update' },
-        OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
-        connect: makeNative(({ connect() {} }).connect, 'connect'),
-        sendMessage: makeNative(({ sendMessage() {} }).sendMessage, 'sendMessage'),
-    };
-
-    // ───────────────────────────── 4. Permissions Query Consistency (Prototype Patch) ─────────────────────────────
+    // ───────────────────────────── 4. Permissions Query Consistency ─────────────────────────────
     try {
         if (window.Permissions && Permissions.prototype && Permissions.prototype.query) {
             const origQuery = Permissions.prototype.query;
@@ -140,7 +154,7 @@
         }
     } catch (_) {}
 
-    // ───────────────────────────── 5. PluginArray & MimeTypeArray (Prototype Patch) ─────────────────────────────
+    // ───────────────────────────── 5. PluginArray & MimeTypeArray (Only When Empty) ─────────────────────────────
     if (!navigator.plugins || navigator.plugins.length === 0 || !(navigator.plugins instanceof PluginArray)) {
         const pluginData = [
             { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', mime: 'application/pdf' },
@@ -149,7 +163,6 @@
             { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', mime: 'application/pdf' },
             { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format', mime: 'application/pdf' }
         ];
-
         try {
             const plugins = Object.create(PluginArray.prototype);
             const mimeTypes = Object.create(MimeTypeArray.prototype);
@@ -204,112 +217,51 @@
         } catch (_) {}
     }
 
-    // ───────────────────────────── 6. WebGL Vendor & Renderer Spoofing ─────────────────────────────
+    // ───────────────────────────── 6. OS-Consistent WebGL Fallback (Software Renderer Only) ─────────────────────────────
+    // Preserves genuine hardware GPU strings on real machines; replaces ONLY SwiftShader / llvmpipe / software renderers.
+    const uaStr = navigator.userAgent || '';
+    const webglFallback = uaStr.includes('Mac OS X')
+        ? { vendor: 'Google Inc. (Apple)', renderer: 'ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)' }
+        : uaStr.includes('Linux') && !uaStr.includes('Android')
+            ? { vendor: 'Google Inc. (Intel)', renderer: 'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)' }
+            : { vendor: 'Google Inc. (NVIDIA)', renderer: 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)' };
+
+    const isSoftwareRenderer = (val) => {
+        if (!val || typeof val !== 'string') return true;
+        const low = val.toLowerCase();
+        return low.includes('swiftshader') || low.includes('llvmpipe') || low.includes('softpipe') || low.includes('basic render driver');
+    };
+
     const patchWebGLProto = (proto) => {
         if (!proto || !proto.getParameter) return;
         const origGetParam = proto.getParameter;
-        const spoofedGetParam = ({
+        const guardedGetParam = ({
             getParameter(param) {
-                // UNMASKED_VENDOR_WEBGL
+                const real = origGetParam.call(this, param);
                 if (param === 37445) {
-                    return 'Google Inc. (NVIDIA)';
+                    const realRenderer = origGetParam.call(this, 37446);
+                    if (isSoftwareRenderer(realRenderer) || isSoftwareRenderer(real)) {
+                        return webglFallback.vendor;
+                    }
+                    return real;
                 }
-                // UNMASKED_RENDERER_WEBGL
                 if (param === 37446) {
-                    return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                    if (isSoftwareRenderer(real)) {
+                        return webglFallback.renderer;
+                    }
+                    return real;
                 }
-                return origGetParam.call(this, param);
+                return real;
             }
         }).getParameter;
-        makeNative(spoofedGetParam, 'getParameter');
-        proto.getParameter = spoofedGetParam;
+        makeNative(guardedGetParam, 'getParameter');
+        proto.getParameter = guardedGetParam;
     };
 
     if (window.WebGLRenderingContext) patchWebGLProto(WebGLRenderingContext.prototype);
     if (window.WebGL2RenderingContext) patchWebGLProto(WebGL2RenderingContext.prototype);
 
-    // ───────────────────────────── 7. Safe Canvas Micro-Noise (Anti-Hash Clustering) ─────────────────────────────
-    // Per-session deterministic noise that NEVER alters transparent pixels or tiny 1x1 probe canvases,
-    // and NEVER mutates the live visible canvas in place.
-    try {
-        const canvasChannelShift = (Math.random() < 0.5) ? 1 : -1;
-        const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-        const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-
-        function perturbNonTransparentPixels(buf) {
-            for (let i = 0; i + 3 < buf.length; i += 400) {
-                if (buf[i + 3] > 0) {
-                    const v = buf[i];
-                    buf[i] = (v === 255 && canvasChannelShift > 0) ? 254
-                           : (v === 0 && canvasChannelShift < 0) ? 1
-                           : (v + canvasChannelShift);
-                }
-            }
-        }
-
-        const spoofedGetImageData = ({
-            getImageData(sx, sy, sw, sh) {
-                const img = origGetImageData.call(this, sx, sy, sw, sh);
-                if (sw * sh >= 16) {
-                    perturbNonTransparentPixels(img.data);
-                }
-                return img;
-            }
-        }).getImageData;
-        makeNative(spoofedGetImageData, 'getImageData');
-        CanvasRenderingContext2D.prototype.getImageData = spoofedGetImageData;
-
-        const spoofedToDataURL = ({
-            toDataURL(type, quality) {
-                if (this.width >= 16 && this.height >= 16) {
-                    try {
-                        const ctx = this.getContext('2d');
-                        if (ctx) {
-                            const clone = document.createElement('canvas');
-                            clone.width = this.width;
-                            clone.height = this.height;
-                            const cctx = clone.getContext('2d');
-                            if (cctx) {
-                                cctx.drawImage(this, 0, 0);
-                                const img = origGetImageData.call(cctx, 0, 0, clone.width, clone.height);
-                                perturbNonTransparentPixels(img.data);
-                                cctx.putImageData(img, 0, 0);
-                                return origToDataURL.call(clone, type, quality);
-                            }
-                        }
-                    } catch (_) {}
-                }
-                return origToDataURL.call(this, type, quality);
-            }
-        }).toDataURL;
-        makeNative(spoofedToDataURL, 'toDataURL');
-        HTMLCanvasElement.prototype.toDataURL = spoofedToDataURL;
-    } catch (_) {}
-
-    // ───────────────────────────── 8. AudioContext Fingerprint Micro-Noise ─────────────────────────────
-    try {
-        if (window.AudioBuffer) {
-            const audioSalt = (Math.random() - 0.5) * 0.0000001;
-            const noisifiedBuffers = new WeakSet();
-            const origGetChannelData = AudioBuffer.prototype.getChannelData;
-            const spoofedGetChannelData = ({
-                getChannelData(channel) {
-                    const data = origGetChannelData.call(this, channel);
-                    if (!noisifiedBuffers.has(data)) {
-                        noisifiedBuffers.add(data);
-                        for (let i = 0; i < data.length; i += 256) {
-                            data[i] = data[i] + audioSalt;
-                        }
-                    }
-                    return data;
-                }
-            }).getChannelData;
-            makeNative(spoofedGetChannelData, 'getChannelData');
-            AudioBuffer.prototype.getChannelData = spoofedGetChannelData;
-        }
-    } catch (_) {}
-
-    // ───────────────────────────── 9. Hardware & Language Consistency (Prototype Patch) ─────────────────────────────
+    // ───────────────────────────── 7. Hardware & Language Fallbacks (Only When Missing) ─────────────────────────────
     try {
         if (!navigator.languages || navigator.languages.length === 0) {
             const langs = Object.freeze(['en-US', 'en']);
@@ -323,7 +275,7 @@
         }
     } catch (_) {}
 
-    // ───────────────────────────── 10. SpeechSynthesis Voices (Prototype Patch) ─────────────────────────────
+    // ───────────────────────────── 8. SpeechSynthesis Voices (Fallback Only When Empty) ─────────────────────────────
     try {
         if (window.SpeechSynthesis && SpeechSynthesis.prototype && SpeechSynthesis.prototype.getVoices) {
             const origGetVoices = SpeechSynthesis.prototype.getVoices;
@@ -351,7 +303,7 @@
         }
     } catch (_) {}
 
-    // ───────────────────────────── 11. MediaDevices Enumerate (Prototype Patch) ─────────────────────────────
+    // ───────────────────────────── 9. MediaDevices Enumerate (Fallback Only When Empty) ─────────────────────────────
     try {
         if (window.MediaDevices && MediaDevices.prototype && MediaDevices.prototype.enumerateDevices) {
             const origEnum = MediaDevices.prototype.enumerateDevices;
@@ -370,7 +322,7 @@
         }
     } catch (_) {}
 
-    // ───────────────────────────── 12. Network Information (Prototype Patch) ─────────────────────────────
+    // ───────────────────────────── 10. Network Information (Only When Missing) ─────────────────────────────
     try {
         if (!navigator.connection) {
             const connection = {
@@ -384,7 +336,7 @@
         }
     } catch (_) {}
 
-    // ───────────────────────────── 13. Screen & Outer Dimensions Sync ─────────────────────────────
+    // ───────────────────────────── 11. Screen & Outer Dimensions Sync (Headless Guard) ─────────────────────────────
     try {
         if (window.outerWidth === 0 || window.outerWidth === window.innerWidth) {
             Object.defineProperty(window, 'outerWidth', {
@@ -400,7 +352,7 @@
         }
     } catch (_) {}
 
-    // ───────────────────────────── 14. Battery API (Prototype Patch — Zero navigator own props) ─────────────────────────────
+    // ───────────────────────────── 12. Battery API (Fallback Only On Rejection) ─────────────────────────────
     try {
         if (navProto && typeof navProto.getBattery === 'function') {
             const origGetBattery = navProto.getBattery;

@@ -16,6 +16,7 @@ use crate::locator::{
 };
 
 pub const EVASION_JS: &str = include_str!("evasion.js");
+pub const EVASION_NOISE_JS: &str = include_str!("evasion_noise.js");
 
 pub struct Tab {
     pub target_id: String,
@@ -666,29 +667,134 @@ impl Tab {
         Ok(())
     }
 
-    pub async fn click(&self, selector: &str, button: &str, click_count: i64, timeout_ms: u64) -> DriverResult<()> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let visible_expr = format!(
-            "(() => {{ const el = {}; if (!el) return false; const s = getComputedStyle(el); \
-             return s.visibility !== 'hidden' && s.display !== 'none' && el.getClientRects().length > 0; }})()",
-            sel_expr(selector)
-        );
-        loop {
-            if self.evaluate(&visible_expr).await.ok() == Some(Value::Bool(true)) {
-                let (x, y) = self.element_center(&sel_expr(selector), selector).await?;
-                return self.mouse_click(x, y, button, click_count).await;
+    /// Probes visibility, enabled state, 2-frame layout stability, and hit-test unobscured status in one async JS pass.
+    const ACTIONABILITY_HELPER_JS: &'static str = r#"
+        async function __bdCheckActionable(el, force) {
+            if (!el || !el.isConnected) return { ok: false, found: false, reason: 'detached' };
+            const s = getComputedStyle(el);
+            if (s.visibility === 'hidden' || s.display === 'none' || parseFloat(s.opacity) === 0 || el.getClientRects().length === 0) {
+                return { ok: false, found: true, reason: 'hidden' };
             }
-            if let Ok(ids) = self.pierce_find_ids(selector).await {
+            if (!force && (el.disabled || el.getAttribute('aria-disabled') === 'true')) {
+                return { ok: false, found: true, reason: 'disabled' };
+            }
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            const nextTick = () => new Promise(res => {
+                let done = false;
+                const fin = () => { if (!done) { done = true; res(); } };
+                if (typeof requestAnimationFrame === 'function') requestAnimationFrame(fin);
+                setTimeout(fin, 35);
+            });
+            const r1 = el.getBoundingClientRect();
+            if (r1.width === 0 || r1.height === 0) {
+                return { ok: false, found: true, reason: 'zero-size' };
+            }
+            if (!force) {
+                await nextTick();
+                const r2 = el.getBoundingClientRect();
+                await nextTick();
+                const r3 = el.getBoundingClientRect();
+                if (Math.abs(r2.left - r1.left) > 1.5 || Math.abs(r2.top - r1.top) > 1.5 ||
+                    Math.abs(r3.left - r2.left) > 1.5 || Math.abs(r3.top - r2.top) > 1.5 ||
+                    Math.abs(r3.width - r1.width) > 1.5 || Math.abs(r3.height - r1.height) > 1.5) {
+                    return { ok: false, found: true, reason: 'moving' };
+                }
+            }
+            const r = el.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            if (!force) {
+                const doc = el.ownerDocument || document;
+                const root = el.getRootNode ? el.getRootNode() : doc;
+                let topHost = el;
+                while (topHost && topHost.getRootNode && topHost.getRootNode().host) {
+                    topHost = topHost.getRootNode().host;
+                }
+                const docHit = doc.elementFromPoint(cx, cy);
+                if (docHit && docHit !== topHost && !topHost.contains(docHit) && !docHit.contains(topHost) && docHit.control !== el) {
+                    return { ok: false, found: true, reason: 'obscured' };
+                }
+                if (root && root !== doc && typeof root.elementFromPoint === 'function') {
+                    const rHit = root.elementFromPoint(cx, cy);
+                    if (rHit && rHit !== el && !el.contains(rHit) && !rHit.contains(el) && rHit.control !== el) {
+                        return { ok: false, found: true, reason: 'obscured' };
+                    }
+                }
+            }
+            return { ok: true, found: true, x: cx, y: cy, w: r.width, h: r.height };
+        }
+    "#;
+
+    pub async fn click(
+        &self,
+        selector: &str,
+        button: &str,
+        click_count: i64,
+        timeout_ms: u64,
+        force: bool,
+    ) -> DriverResult<()> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let probe_expr = format!(
+            "(async () => {{ {} const el = {}; return await __bdCheckActionable(el, {}); }})()",
+            Self::ACTIONABILITY_HELPER_JS,
+            sel_expr(selector),
+            force
+        );
+        let mut last_reason = String::from("not-found");
+        loop {
+            if let Ok(res) = self.evaluate(&probe_expr).await {
+                if res.get("ok") == Some(&Value::Bool(true)) {
+                    let (ox, oy) = self.frame_viewport_offset().await;
+                    if let Some((x, y)) = Self::jittered_center(&res) {
+                        self.mouse_move(x + ox, y + oy).await?;
+                        // Re-verify target stayed in place during the Bézier arc; re-aim cleanly if it shifted
+                        let (mut fx, mut fy) = (x + ox, y + oy);
+                        if !force {
+                            if let Ok(res2) = self.evaluate(&probe_expr).await {
+                                if res2.get("ok") == Some(&Value::Bool(true)) {
+                                    if let Some((nx, ny)) = Self::jittered_center(&res2) {
+                                        let (ox2, oy2) = self.frame_viewport_offset().await;
+                                        if (nx + ox2 - fx).abs() > 3.0 || (ny + oy2 - fy).abs() > 3.0 {
+                                            fx = nx + ox2;
+                                            fy = ny + oy2;
+                                            self.mouse_move(fx, fy).await?;
+                                        }
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+                        }
+                        return self.mouse_click(fx, fy, button, click_count).await;
+                    }
+                }
+                let found = res.get("found") == Some(&Value::Bool(true));
+                if let Some(reason) = res.get("reason").and_then(|v| v.as_str()) {
+                    last_reason = reason.to_string();
+                }
+                if !found {
+                    if let Ok(ids) = self.pierce_find_ids(selector).await {
+                        for nid in ids {
+                            if self.click_node(nid, button, click_count, force).await.is_ok() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            } else if let Ok(ids) = self.pierce_find_ids(selector).await {
                 for nid in ids {
-                    if self.click_node(nid, button, click_count).await.is_ok() {
+                    if self.click_node(nid, button, click_count, force).await.is_ok() {
                         return Ok(());
                     }
                 }
             }
             if Instant::now() >= deadline {
-                return Err(DriverError::Timeout(format!("Chờ phần tử '{}' quá {}ms", selector, timeout_ms)));
+                return Err(DriverError::Timeout(format!(
+                    "Chờ phần tử '{}' sẵn sàng để click quá {}ms (trạng thái cuối: {})",
+                    selector, timeout_ms, last_reason
+                )));
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(80)).await;
         }
     }
 
@@ -1060,9 +1166,29 @@ impl Tab {
         Ok((x + ox, y + oy))
     }
 
-    pub async fn click_node(&self, backend_node_id: i64, button: &str, click_count: i64) -> DriverResult<()> {
-        let (x, y) = self.node_center(backend_node_id).await?;
-        self.mouse_click(x, y, button, click_count).await
+    pub async fn click_node(&self, backend_node_id: i64, button: &str, click_count: i64, force: bool) -> DriverResult<()> {
+        if force {
+            let (x, y) = self.node_center(backend_node_id).await?;
+            return self.mouse_click(x, y, button, click_count).await;
+        }
+        let (ox, oy) = self.frame_viewport_offset().await;
+        let fn_decl = format!(
+            "async function(force) {{ {} return await __bdCheckActionable(this, force); }}",
+            Self::ACTIONABILITY_HELPER_JS
+        );
+        let res = self
+            .call_on_node(backend_node_id, &fn_decl, vec![json!({ "value": force })])
+            .await?;
+        if res.get("ok") != Some(&Value::Bool(true)) {
+            let reason = res.get("reason").and_then(|v| v.as_str()).unwrap_or("not-actionable");
+            return Err(DriverError::NotFound(format!(
+                "backendNodeId={} chưa sẵn sàng để click ({})",
+                backend_node_id, reason
+            )));
+        }
+        let (x, y) = Self::jittered_center(&res)
+            .ok_or_else(|| DriverError::NotFound(format!("backendNodeId={} không hiển thị", backend_node_id)))?;
+        self.mouse_click(x + ox, y + oy, button, click_count).await
     }
 
     pub async fn hover_node(&self, backend_node_id: i64) -> DriverResult<()> {
@@ -1164,7 +1290,7 @@ impl Tab {
 
     pub async fn check_node(&self, backend_node_id: i64, checked: bool) -> DriverResult<()> {
         if self.is_checked_node(backend_node_id).await? != checked {
-            self.click_node(backend_node_id, "left", 1).await?;
+            self.click_node(backend_node_id, "left", 1, false).await?;
         }
         Ok(())
     }
@@ -1650,7 +1776,7 @@ impl Tab {
             return Ok(());
         }
         if self.element_center(&sel_expr(selector), selector).await.is_ok() {
-            self.click(selector, "left", 1, timeout_ms).await
+            self.click(selector, "left", 1, timeout_ms, false).await
         } else {
             let label = format!(
                 "(() => {{ const el = {}; return el.closest('label') || (el.id && document.querySelector('label[for=\"' + CSS.escape(el.id) + '\"]')) || el.parentElement; }})()",
